@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -138,6 +139,66 @@ def _trace(text: str) -> None:
         print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} trace {text}", flush=True)
 
 
+def shape_path() -> Path:
+    """While this file exists the proxy logs the SHAPE of each model request: header names, body
+    keys, the first words of the system prompt blocks, counts. For working out what tells a
+    session or a subagent apart. Ids are masked; message text and credentials are never logged."""
+    return Path.home() / ".claude-swap-backup" / "desktop-follow" / "shape"
+
+
+_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{16,}")
+
+
+def _mask(text: str) -> str:
+    return _ID.sub("<id>", text)
+
+
+def _session_tag(user_id) -> str | None:
+    """A short hash of the session id in ``metadata.user_id`` (a JSON string), to tell sessions
+    apart in the log without logging the id."""
+    try:
+        sid = json.loads(user_id).get("session_id") if isinstance(user_id, str) else None
+    except ValueError:
+        return None
+    return hashlib.sha1(sid.encode()).hexdigest()[:6] if isinstance(sid, str) and sid else None
+
+
+def _shape(flow) -> None:
+    if not shape_path().exists() or not is_inference(flow.request.pretty_host, flow.request.path):
+        return
+    try:
+        req = flow.request
+        try:
+            body = json.loads(req.get_content() or b"{}")
+        except ValueError:
+            body = {}
+        system = body.get("system")
+        blocks = [system] if isinstance(system, str) else [b.get("text", "") for b in system or [] if isinstance(b, dict)]
+        tools = [t.get("name", "") for t in body.get("tools") or [] if isinstance(t, dict)]
+        meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        messages = body.get("messages") or []
+        names = sorted(h.lower() for h in req.headers.keys())
+        interesting = {h: _mask(str(req.headers[h]))[:80] for h in req.headers.keys()
+                       if any(k in h.lower() for k in ("session", "agent", "client-request", "x-app", "anthropic-beta", "user-agent", "request-class", "dispatch", "prompt-id"))}
+        sock = getattr(flow.client_conn, "sockname", None)
+        line = {
+            "path": req.path.split("?")[0], "model": body.get("model"), "stream": body.get("stream"),
+            "body_keys": sorted(body), "metadata": {k: _mask(str(v))[:100] for k, v in meta.items()},
+            "session": _session_tag(meta.get("user_id")),
+            "thread": sorted(body["thread"]) if isinstance(body.get("thread"), dict) else type(body.get("thread")).__name__,
+            "agent_prompt": any("You are an agent for Claude Code" in b for b in blocks),
+            "system_blocks": len(blocks), "system_heads": [_mask(b[:60]) for b in blocks[:3]],
+            "tools": len(tools), "tools_hash": hashlib.sha1(",".join(sorted(tools)).encode()).hexdigest()[:8],
+            "messages": len(messages), "roles": "".join(m.get("role", "?")[0] for m in messages[-6:] if isinstance(m, dict)),
+            "header_names": names, "header_values": interesting,
+            "listening_port": sock[1] if isinstance(sock, (tuple, list)) and len(sock) > 1 else None,
+            "client_port": (flow.client_conn.peername or (None, None))[1] if getattr(flow.client_conn, "peername", None) else None,
+        }
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} shape {json.dumps(line)}", flush=True)
+    except Exception as exc:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} shape error {type(exc).__name__}: {exc}", flush=True)
+
+
 def ledger_path() -> Path:
     """One JSON line per billed inference request: when, which account, the API's request id."""
     return Path.home() / ".claude-swap-backup" / "desktop-follow" / "requests.jsonl"
@@ -202,6 +263,7 @@ class FollowActive:
             flow.comment = "cswap: billed to active account"
         if is_inference(flow.request.pretty_host, flow.request.path):
             flow.metadata["cswap_account"] = billed_account(flow.request.headers)
+        _shape(flow)
         _trace(f"> {flow.request.method} {flow.request.pretty_host}{flow.request.path.split('?')[0][:90]}")
 
     def responseheaders(self, flow) -> None:

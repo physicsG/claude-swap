@@ -160,3 +160,20 @@ def test_a_proxy_that_never_published_the_marker_does_not_remove_it(tmp_path, mo
     assert marker.exists()
     running.done()
     assert not marker.exists()
+
+
+def test_shape_logging_is_off_unless_asked_and_never_logs_message_text(creds, tmp_path, monkeypatch, capsys):
+    shape = tmp_path / "shape"
+    monkeypatch.setattr(follow_active, "shape_path", lambda: shape)
+    body = json.dumps({"model": "m", "system": [{"text": "You are an agent. cwd=C:/secret"}], "messages": [{"role": "user", "content": "private words"}],
+                       "tools": [{"name": "Bash"}], "metadata": {"user_id": "user_0123456789abcdef0123_session_12345678-1234-1234-1234-123456789abc"}}).encode()
+    flow = _flow()
+    flow.request.get_content = lambda: body
+    flow.client_conn = type("C", (), {"sockname": ("127.0.0.1", 8899), "peername": ("127.0.0.1", 5555)})()
+    follow_active._shape(flow)
+    assert capsys.readouterr().out == ""  # off by default
+    shape.write_text("")
+    follow_active._shape(flow)
+    out = capsys.readouterr().out
+    assert "shape " in out and "<id>" in out and '"listening_port": 8899' in out
+    assert "private words" not in out and "012345678" not in out and "Bearer" not in out

@@ -13,8 +13,8 @@ for whoever picks this up next, human or agent. Start with the status table.
 | 4 | The credential decides the active account | committed, branch `fix/credential-owns-active`, no PR yet | `switcher.py` (`live_credential_owner`, `reconcile_identity`) |
 | 5 | The account bar (swap-meter) | shipped, PR RomanovX/claude-mods#1 | `claude-mods/plugins/swap-meter/hooks` |
 | 6 | What a switch costs (cache rebuild) | measured | section 6 |
-| 7 | **An account per project** | **proposed** | section 7 |
-| 8 | **An account per subagent** | **proposed, nice to have** | section 8 |
+| 7 | **An account per session (and so per project)** | **designed; spikes S1 and S4 done, build not started** | section 7, mockup `mockups/account-bar.html` |
+| 8 | **Subagents on another account** | **designed (nice to have); identification verified** | section 8 |
 
 Commands you will need: `cswap desktop-follow --on|--off|--state|--heal`,
 `cswap usage-report --open`. Everything lives under `~\.claude-swap-backup\desktop-follow\`
@@ -71,6 +71,7 @@ Each of these was observed, not guessed.
 | Phone messages never reached Claude Code | mitmproxy buffers responses until they end; Remote Control's inbound channel `GET /v1/code/sessions/<id>/worker/events/stream` never ends, so it never answered and the client reconnected forever | `responseheaders` hook sets `flow.response.stream = True` for every response |
 | `--off` left a proxy running | A start that timed out wrote the stale pid back over the new proxy's pid | Reload state before saving the failure |
 | Proxy "up" but every request stalls | A hung proxy still accepts connections (the kernel queues them), so a connect check passes | `proxy_responsive()` sends a request and wants an `HTTP/` reply; `--state` and `--ensure` use it |
+| `uv tool install --force` fails with "Access is denied" and leaves cswap broken (`No module named claude_swap`) | The minute task's `pythonw.exe` lives in the tool's `Scripts` folder and holds it while it runs | Retry the install a few times; the proxy and the task come back once it succeeds |
 | Band showed the wrong account as billed | The marker file went missing: a second proxy that failed to bind the port exited through `done()` and withdrew the running one's marker | Only the instance that published the marker withdraws it; `--ensure` puts it back |
 
 Debugging aid: create the file `desktop-follow\trace` and the proxy logs method, host,
@@ -163,97 +164,112 @@ About 50 to 60K still hits (the shared prefix); the rest of the context is writt
 each way. Consequences for any design: never alternate accounts per request; a session (or
 a whole subagent) should stay on one account for as long as it runs.
 
-## 7. Proposed: an account per project (Code tab)
+## 7. An account per session (and so per project)
 
-Requirement: several projects at once, each on its own account; switching one must not move
-the others.
+Decided with the user while reviewing the mockup (`mockups/account-bar.html`):
 
-Idea: the proxy picks the account from *which proxy address the session uses*, not from one
-global answer. Set it per project in the Code tab environment (the variables are per
-environment; this is how the work started).
+- Several projects run at once, each on its own account. Switching one must not move the others.
+- The bar acts on **this session only**. There is no "set the global default" control and no
+  threshold rule (the above-80% idea was dropped). A session shows as its own filled dot; other
+  sessions show only as a hollow dot with a count.
+- `cswap switch` and `cswap auto` still exist. Their only effect on the Code tab is the
+  account a *new* session starts on (below).
 
-- **Label by port (preferred).** One mitmproxy process listens on several ports,
-  e.g. `8899` (follow the global active account, today's behaviour), `8900` (account 1),
-  `8901` (account 2). The addon reads `flow.client_conn.sockname[1]` and looks the port up in
-  a table. A project's environment sets `HTTPS_PROXY=http://127.0.0.1:8901`.
-- **Label by proxy login (fallback).** `HTTPS_PROXY=http://acct2@127.0.0.1:8899`; the label
-  arrives as a `Proxy-Authorization` on the CONNECT request. Depends on the client sending
-  credentials from the URL.
-- **Tokens for accounts that are not active.** This is the hard part. Today the addon reads
-  the live credential file, which holds only the active account. A pinned account needs its
-  own fresh access token. cswap keeps backups encrypted and refreshes them only through its
-  locked machinery (refresh tokens rotate; a second refresher strands one of them). So:
-  cswap, not the proxy, refreshes, and publishes `desktop-follow\tokens.json` (mode 0600,
-  per account: access token and `expiresAt`) from the minute task; the addon only reads it
-  and, like today, does not substitute an expired token. Cost: tokens of inactive accounts
-  sit in plaintext on disk, as the live one already does.
-- **Bar:** show per session which account it bills (the band can read its own
-  `HTTPS_PROXY` through `$.env`), and offer "pin this session to account N" next to the
-  global switch. The usage report gains a per-project account column for free (the ledger
-  already has the account and the transcript has `cwd`).
-- **Unchanged:** Remote Control and Artifacts stay on the app's account. A global switch
-  moves only sessions on the follow-active port.
+### What the proxy can see (spike S4, verified)
 
-Unverified (spikes, section 9): S1 mitmproxy exposes the listening port to the addon;
-S2 Claude Code sends credentials from a proxy URL (for the fallback); S3 a Code tab
-environment's `HTTPS_PROXY` wins over the global one in `~/.claude.json`.
+Every model request (`/v1/messages`) carries, as plain headers and body fields:
 
-Rejected: a different proxy process per account (more processes to keep alive; the port
-route gets the same with one); choosing the account by working folder at the proxy (the
-proxy cannot see the folder; the transcript knows it only afterwards); `cswap run` for the
-Code tab (terminal only; it is the right tool for terminal sessions and `cswap map` already
-binds a folder to an account there).
+| What | Where | Use |
+| --- | --- | --- |
+| Session id | header `x-claude-code-session-id`, and `metadata.user_id` (a JSON string with `device_id`, `account_uuid`, `session_id`) | Identifies the session. The same id as `sessionId` in the transcripts, so the ledger joins to a project |
+| Request class | header `x-claude-code-request-class`: `main` or `subagent` | Tells a subagent's calls from the session's own |
+| Prompt id | header `x-claude-code-prompt-id` | Probably per user prompt: subagents spawned by one prompt share it (not confirmed) |
+| Listening port | `flow.client_conn.sockname` | Which proxy port the client used (spike S1, verified) |
 
-## 8. Proposed: an account per subagent (nice to have)
+Observed with this session: the main loop, its helper calls and its subagents all carry one
+session id; subagent calls have class `subagent` and, in the first call, an extra system block
+"You are an agent for Claude Code" with 46 tools. Helper calls Desktop makes for a session
+(titles, classifiers) carry the session id too, with class `main`.
 
-Requirement: when one account is nearly full, consecutive subagents should run on the
-emptier one.
+### Design: one proxy port, a table keyed by session id
 
-Subagents run inside the main Claude Code process: same environment, same connection pool,
-so section 7's address trick cannot tell them apart. The proxy would have to recognise a
-subagent's request itself.
+- The proxy keeps `sessions.json`: `session id -> account`. The addon reads it (cached by mtime,
+  like the credential file).
+- **First sight pins.** A request from an unknown session id records that session on the account
+  cswap has active at that moment. From then on the session stays there, so a global
+  `cswap switch` or `cswap auto` moves only sessions started afterwards. This is what makes
+  several projects independent without any per-project setup.
+- **The bar moves a session.** A click writes this session's id and the chosen account into
+  `sessions.json`. The next request goes out on the new account. It costs a cache rebuild (section 6),
+  so the bar should say so. The band must know its own session id (spike S6).
+- Entries expire (for example 7 days idle), and `cswap desktop-follow --sessions` lists them.
+- **Tokens for accounts that are not active.** Still the hard part. The addon reads the live
+  credential file, which holds only the active account. A pinned session on another account needs
+  that account's fresh access token. cswap refreshes only through its locked machinery (refresh
+  tokens rotate; a second refresher strands one), so cswap publishes `desktop-follow\tokens.json`
+  (0600; per account: access token, `expiresAt`) from the minute task; the addon reads it and, as
+  today, never substitutes an expired token (the request keeps the app's login). Cost: tokens of
+  inactive accounts sit in plaintext, as the active one already does. A pinned account whose token
+  could not be refreshed bills the app's account, and the bar must show that (state "unknown").
+- **Ledger:** add `session` (full id) and `class` to each line. The report then breaks down by
+  session and project, and the bar's counts come from the last 60 seconds of the ledger (distinct
+  session ids per account), published as `activity.json`.
+- **Unchanged:** Remote Control and Artifacts stay on the app's account.
 
-- **Identify (unverified).** Candidates: the system prompt prefix and tool list in the
-  request body differ for subagents; a header or the `metadata.user_id` may carry a session
-  or agent id. Nothing is confirmed (S4).
-- **Pin per subagent, never per request.** A subagent's conversation gets a key (hash of its
-  system prompt and first user message). The first request with an unseen key picks an
-  account by the rule; later requests with that key follow the pin (kept in memory with a
-  file copy and a TTL). A subagent's context is small, so its own cache rebuild is cheap,
-  unlike the main session's 260 to 300K tokens (section 6).
-- **Rule options.** (a) threshold: if the main account's 5h is above X%, new subagents go to
-  the account with the most headroom; (b) always the account with more headroom; (c) manual:
-  a mark in a file or the bar ("subagents use account N"). Headroom comes from cswap's usage
-  cache (`cache\usage.json`), which the addon can read.
-- **Needs section 7's token publishing** for the non-active account.
-- **Limits.** The main session stays on its account and can still hit the limit; only
-  subagent load moves. A wrong identification would pin a main-session request to the other
-  account and cost a cache rebuild, so the fingerprint must be conservative (pin only when
-  sure). A subagent that hits a rate limit on its account fails like any other call.
-- **Bar:** a count of subagents per account, and a way to see which account a subagent used
-  (the ledger gets an `agent` key once identification exists).
-- **Alternative that needs no proxy work:** the agent starts a separate headless run itself,
-  `cswap run <account> -- -p "<task>"`, for work that should use the other account. Explicit
-  rather than automatic, terminal-only, and it works today.
+Superseded: labelling sessions by proxy port or proxy login (`HTTPS_PROXY=http://127.0.0.1:8901`
+per Code tab environment). It would work for launch-time choices but cannot move a running
+session, and needs per-project setup. The port is still useful as an escape hatch.
+Rejected: a different proxy process per account; `cswap run` for the Code tab (terminal only; it
+and `cswap map` remain the way to bind a folder to an account for terminal sessions).
+
+## 8. Subagents on another account (nice to have)
+
+Requirement: a session's consecutive subagents can use the other account, for example when the
+session's own account is nearly full.
+
+Identification is solved: header `x-claude-code-request-class: subagent` (section 7). No
+fingerprinting of system prompts is needed.
+
+- **Rule:** the table gets an optional `subagents -> account` per session (default: same account as
+  the session). A subagent request resolves to that account, otherwise to its session's.
+- **Why this is cheap:** a subagent has a small context of its own, so its cache rebuild is small
+  compared with the main session's 260 to 300K tokens (section 6), and the session's own account
+  and cache are untouched. Only the subagent load moves.
+- **Setting it:** manual, from the bar ("send subagents to gordian-claude"), shown as the
+  `↳ 1 agent` chip on the account they run on (as in the mockup). The above-threshold trigger was
+  dropped by the user; an automatic rule can be added later without changing the table.
+- **Individual subagents:** `x-claude-code-prompt-id` may group the subagents of one prompt. A
+  per-subagent id was not found in the headers; the first request of a subagent also carries
+  the extra system block. If per-subagent pins are ever needed, key them on a hash of that
+  conversation's first message.
+- **Visibility:** ledger lines with `class: subagent` give per-account subagent counts for the bar
+  and a "by subagent" block in the usage report.
+- **Limits:** the main session stays on its account and can still hit the limit. A subagent that
+  hits a limit on its account fails like any other call. Needs the token publishing from section 7.
+- **No proxy needed today:** an agent can run `cswap run <account> -- -p "<task>"` for work that
+  should use the other account. Explicit, terminal-only.
 
 ## 9. Open questions and spikes
 
-Each is small and read-only except the restart noted.
-
-- **S1** Does mitmproxy give the addon the local port a client connected to
-  (`flow.client_conn.sockname`)? Start `mitmdump --mode regular@8899 --mode regular@8900`
-  with a two-line addon that logs it. Needs a proxy restart.
-- **S2** Does Claude Code turn `http://user@host:port` in `HTTPS_PROXY` into
-  `Proxy-Authorization`? Log the CONNECT request headers' names.
-- **S3** Per-environment variable precedence: with both the global `env` block and a Code
-  tab environment setting `HTTPS_PROXY`, which does the session use? Check the port the
-  proxy sees.
-- **S4** What tells a subagent's request apart from the main session's? Log header names and
-  body top-level keys, `metadata` keys and the first 60 characters of the system prompt for
-  `/v1/messages` (not values of anything secret). Compare a main and a subagent call.
-- **S5** Can cswap hand the proxy fresh tokens for inactive accounts through its existing
-  locked refresh path without stranding a refresh token that `cswap run` also uses?
+- **S1 done.** `flow.client_conn.sockname` gives the listening port (logged as 8899).
+- **S4 done.** Session id, request class and prompt id are headers (section 7).
+- **S2 not needed** unless the proxy-login labelling comes back.
+- **S3 open** (only matters for the port escape hatch): which `HTTPS_PROXY` wins when both the
+  global `env` block and a Code tab environment set it.
+- **S5 open:** can cswap hand the proxy fresh tokens for inactive accounts through its existing
+  locked refresh path without stranding a refresh token that `cswap run` also uses? Decides how
+  `tokens.json` is produced. This is the main risk of the whole design.
+- **S6 open:** does the swap-meter plugin know its own session id (an API on `$`, or the
+  `CLAUDE_CODE_SESSION_ID` environment)? Without it the bar cannot say which row is "this session"
+  or move it. It must equal the header value.
+- **S7 open:** is `x-claude-code-prompt-id` per prompt, and is there a per-subagent id anywhere
+  (headers, body `thread`)?
 - Whether Claude Desktop is the writer of `oauthAccount` (design 4) is inferred, not seen.
+
+Debugging aid used for S1 and S4: create the file `desktop-follow\shape` and the proxy logs, per
+model request, the header names, body keys, the first words of the system blocks, counts, a hashed
+session tag and the listening port (ids are masked, message text and credentials are never logged).
+Delete the file when done.
 
 ## 10. Reading list
 
