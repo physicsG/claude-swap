@@ -216,12 +216,45 @@ def _serve(reply):
     return server, conns
 
 
-def test_a_proxy_that_answers_is_responsive():
-    server, _ = _serve(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+def test_a_proxy_whose_addon_answers_the_probe_is_responsive():
+    server, conns = _serve(b"HTTP/1.1 200 OK\r\ncontent-length: 8\r\n\r\ncswap-ok")
     try:
         assert df.proxy_responsive(server.getsockname()[1])
     finally:
         server.close()
+        for c in conns:
+            c.close()
+
+
+def test_a_proxy_that_forwards_but_lost_its_addon_is_not_responsive():
+    # Without the addon the probe is forwarded to a host that does not exist: a gateway error.
+    server, conns = _serve(b"HTTP/1.1 502 Bad Gateway\r\n\r\nno such host")
+    try:
+        assert df.proxy_alive(server.getsockname()[1])
+        assert not df.proxy_responsive(server.getsockname()[1])
+    finally:
+        server.close()
+        for c in conns:
+            c.close()
+
+
+def test_the_proxy_runs_from_a_staged_copy_of_the_addon(home):
+    staged = df.stage_addon()
+    assert staged.parent == df.state_dir() and staged.read_bytes() == df.addon_path().read_bytes()
+    assert str(staged) in df.proxy_command("mitmdump", 8899, staged)
+
+
+def test_a_reinstalled_addon_restarts_the_proxy(home, monkeypatch):
+    df.save_state({"enabled": True, "port": 9, "addon_sha": "old"})
+    order = []
+    monkeypatch.setattr(df, "proxy_alive", lambda port: True)
+    monkeypatch.setattr(df, "proxy_responsive", lambda port, timeout=3.0: True)
+    monkeypatch.setattr(df, "stop_proxy", lambda: order.append("stop"))
+    monkeypatch.setattr(df, "start_proxy", lambda port: order.append("start"))
+    assert df.ensure() == "restarted" and order == ["stop", "start"]
+    df.save_state({"enabled": True, "port": 9, "addon_sha": df.addon_sha()})
+    order.clear()
+    assert df.ensure() == "ok" and order == []
 
 
 def test_a_proxy_that_accepts_but_never_answers_is_not_responsive():
@@ -262,3 +295,116 @@ def test_ensure_puts_the_band_marker_back(home, monkeypatch):
     assert not df.marker_path().exists()
     assert df.ensure() == "ok"
     assert "claude-desktop" in df.marker_path().read_text()
+
+
+# --- an account per session ---------------------------------------------------------------------
+
+def _sequence(root, active="1"):
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "sequence.json").write_text(json.dumps({
+        "activeAccountNumber": int(active),
+        "accounts": {"1": {"email": "a@x.com", "alias": "work"}, "2": {"email": "b@x.com"}}}))
+
+
+def test_account_arguments_resolve_by_number_email_and_alias(home):
+    root, _ = home
+    _sequence(root)
+    assert df.resolve_account("2") == "b@x.com"
+    assert df.resolve_account("B@X.com") == "b@x.com"
+    assert df.resolve_account("work") == "a@x.com"
+    assert df.resolve_account("b") == "b@x.com"  # the name before the @, as the band shows it
+    with pytest.raises(ClaudeSwitchError):
+        df.resolve_account("nobody")
+
+
+def test_per_session_mode_is_a_state_flag(home):
+    df.set_per_session(True)
+    assert df.load_state()["per_session"] is True
+    df.set_per_session(False)
+    assert df.load_state()["per_session"] is False
+
+
+def test_pin_and_unpin_a_session_and_its_subagents(home, monkeypatch):
+    root, _ = home
+    _sequence(root)
+    monkeypatch.setattr(df, "publish_tokens", lambda: 0)
+    assert df.pin_session("s1", "2") == "b@x.com"
+    assert df.read_sessions()["s1"]["account"] == "b@x.com"
+    assert df.pin_session("s1", "work", subagents=True) == "a@x.com"
+    entry = df.read_sessions()["s1"]
+    assert entry["account"] == "b@x.com" and entry["subagents"] == "a@x.com"
+    assert df.pin_session("s1", None, subagents=True) == ""
+    assert "subagents" not in df.read_sessions()["s1"]
+
+
+def test_run_lists_pins_and_forgets_sessions(home, monkeypatch, capsys):
+    root, _ = home
+    _sequence(root)
+    monkeypatch.setattr(df.sys, "platform", "win32")
+    monkeypatch.setattr(df, "publish_tokens", lambda: 0)
+    assert df.run(["--pin", "s1", "2"]) == 0
+    assert df.run(["--sessions"]) == 0
+    assert "s1  b@x.com" in capsys.readouterr().out
+    assert df.run(["--unpin", "s1"]) == 0
+    assert df.read_sessions() == {}
+    assert df.run(["--unpin", "s1"]) == 1
+    assert df.run(["--pin", "s1", "nobody"]) == 1
+
+
+def test_old_sessions_are_pruned(home):
+    root, _ = home
+    df.write_sessions({"old": {"account": "a@x.com", "seen": "2020-01-01T00:00:00Z"},
+                       "new": {"account": "a@x.com", "seen": df.time.strftime("%Y-%m-%dT%H:%M:%SZ", df.time.gmtime())}})
+    assert df.prune_sessions() == 1
+    assert set(df.read_sessions()) == {"new"}
+
+
+def test_publish_tokens_writes_only_the_accounts_that_are_not_active(home, monkeypatch):
+    root, _ = home
+    _sequence(root, active="1")
+
+    class Switcher:
+        def _get_sequence_data(self):
+            return json.loads((root / "sequence.json").read_text())
+
+        def _read_account_credentials(self, num, email):
+            return json.dumps({"claudeAiOauth": {"accessToken": f"tok-{num}", "refreshToken": "r", "expiresAt": 9_999_999_999_999}})
+
+    monkeypatch.setattr("claude_swap.switcher.ClaudeAccountSwitcher", Switcher)
+    assert df.publish_tokens() == 1
+    written = json.loads(df.tokens_path().read_text())["accounts"]
+    assert list(written) == ["b@x.com"] and written["b@x.com"]["accessToken"] == "tok-2"
+
+
+def test_the_minute_task_publishes_tokens_only_in_per_session_mode(home, monkeypatch):
+    calls = []
+    monkeypatch.setattr(df, "publish_tokens", lambda: calls.append("tokens"))
+    monkeypatch.setattr(df, "prune_sessions", lambda: calls.append("prune"))
+    monkeypatch.setattr(df, "proxy_alive", lambda port: True)
+    monkeypatch.setattr(df, "proxy_responsive", lambda port, timeout=3.0: True)
+    df.save_state({"enabled": True, "port": 9})
+    df.ensure()
+    assert calls == []
+    df.save_state({"enabled": True, "port": 9, "per_session": True})
+    df.ensure()
+    assert calls == ["tokens", "prune"]
+
+
+def test_setting_subagents_on_an_unseen_session_pins_it_where_it_is(home, monkeypatch):
+    root, _ = home
+    _sequence(root, active="2")
+    monkeypatch.setattr(df, "publish_tokens", lambda: 0)
+    df.pin_session("new", "1", subagents=True)
+    assert df.read_sessions()["new"]["account"] == "b@x.com"
+    assert df.read_sessions()["new"]["subagents"] == "a@x.com"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process control")
+def test_stop_kills_the_recorded_pid_and_any_other_proxy_of_ours_on_the_port(home, monkeypatch):
+    df.save_state({"enabled": True, "port": 8899, "pid": 4242})
+    calls = []
+    monkeypatch.setattr(df.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    df.stop_proxy()
+    assert calls[0][:3] == ["taskkill", "/PID", "4242"]
+    script = calls[1][-1]
+    assert "--listen-port 8899 " in script and "desktop-follow" in script and "Stop-Process" in script

@@ -87,13 +87,22 @@ def save_state(state: dict) -> None:
 
 
 def proxy_responsive(port: int, timeout: float = 3.0) -> bool:
-    """The proxy answers a request. A hung proxy still accepts connections (the kernel queues them),
-    so a plain connect says it is up while every request through it stalls."""
+    """The proxy answers, and our addon is the one answering. A hung proxy still accepts connections
+    (the kernel queues them), and a proxy that lost its addon still forwards every request, so
+    neither a connect nor an ordinary request proves it works: ask the addon's own probe."""
     try:
         with socket.create_connection((LISTEN_HOST, port), timeout=timeout) as conn:
             conn.settimeout(timeout)
-            conn.sendall(b"GET http://127.0.0.1:9/ HTTP/1.1\r\nHost: 127.0.0.1:9\r\nConnection: close\r\n\r\n")
-            return conn.recv(8).startswith(b"HTTP/")
+            conn.sendall(b"GET http://cswap.invalid/ping HTTP/1.1\r\nHost: cswap.invalid\r\nConnection: close\r\n\r\n")
+            reply = b""
+            while len(reply) < 512:
+                chunk = conn.recv(512)
+                if not chunk:
+                    break
+                reply += chunk
+                if b"cswap-ok" in reply:
+                    break
+            return reply.startswith(b"HTTP/") and b"cswap-ok" in reply
     except OSError:
         return False
 
@@ -166,13 +175,32 @@ def find_mitmdump() -> str:
     return found
 
 
-def proxy_command(mitmdump: str, port: int) -> list[str]:
+def addon_sha(path: Path | None = None) -> str:
+    import hashlib
+
+    try:
+        return hashlib.sha256((path or addon_path()).read_bytes()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def stage_addon() -> Path:
+    """Copy the addon next to the state and run the proxy from the copy. mitmproxy watches the script
+    it was given and reloads it when the file changes; reinstalling cswap rewrites the installed file,
+    and a reload that fails leaves the proxy running with no addon, forwarding everything unchanged."""
+    state_dir().mkdir(parents=True, exist_ok=True)
+    staged = state_dir() / "addon_running.py"
+    shutil.copyfile(addon_path(), staged)
+    return staged
+
+
+def proxy_command(mitmdump: str, port: int, addon: Path | None = None) -> list[str]:
     return [
         mitmdump,
         "--listen-host", LISTEN_HOST,
         "--listen-port", str(port),
         "--set", f"confdir={state_dir() / _CONFDIR}",
-        "-s", str(addon_path()),
+        "-s", str(addon or addon_path()),
         "-q",
     ]
 
@@ -193,9 +221,10 @@ def start_proxy(port: int) -> None:
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startup.wShowWindow = subprocess.SW_HIDE
         extra["startupinfo"] = startup
+    staged = stage_addon()
     with open(state_dir() / "proxy.log", "ab") as log:
         proc = subprocess.Popen(
-            proxy_command(find_mitmdump(), port),
+            proxy_command(find_mitmdump(), port, staged),
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
@@ -206,6 +235,7 @@ def start_proxy(port: int) -> None:
         )
     state = load_state()
     state["pid"] = proc.pid
+    state["addon_sha"] = addon_sha()
     save_state(state)
     deadline = time.monotonic() + _STARTUP_WAIT_S
     while time.monotonic() < deadline:
@@ -222,12 +252,21 @@ def start_proxy(port: int) -> None:
 
 
 def stop_proxy() -> None:
-    pid = load_state().get("pid")
-    if isinstance(pid, int) and pid > 0 and sys.platform == "win32":
+    """Kill the recorded proxy, and any other proxy of ours still on the port: the recorded pid goes
+    stale (a start that timed out, a restart by another run), and a proxy left alive keeps the port
+    and makes the next start return at once, so a hung or addon-less proxy would never be replaced."""
+    if sys.platform == "win32":
+        pid = load_state().get("pid")
+        quiet = {"capture_output": True, "check": False, "creationflags": subprocess.CREATE_NO_WINDOW}
+        if isinstance(pid, int) and pid > 0:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], **quiet)
+        port = load_state().get("port") or DEFAULT_PORT
         subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            check=False,
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*mitmdump*' "
+             f"-and $_.CommandLine -like '*--listen-port {int(port)} *' -and $_.CommandLine -like '*desktop-follow*' }} "
+             "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+            timeout=30, **quiet,
         )
     marker_path().unlink(missing_ok=True)
 
@@ -302,6 +341,143 @@ def _ensure_marker() -> None:
         pass
 
 
+# --- an account per session -----------------------------------------------
+
+SESSION_MAX_IDLE_S = 7 * 86400
+
+
+def sessions_path() -> Path:
+    return state_dir() / "sessions.json"
+
+
+def tokens_path() -> Path:
+    return state_dir() / "tokens.json"
+
+
+def read_sessions() -> dict:
+    try:
+        data = json.loads(sessions_path().read_text(encoding="utf-8")).get("sessions") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_sessions(sessions: dict) -> None:
+    state_dir().mkdir(parents=True, exist_ok=True)
+    atomic_write_text(sessions_path(), json.dumps({"version": 1, "sessions": sessions}, indent=1))
+
+
+def _sequence() -> dict:
+    try:
+        data = json.loads((paths.get_backup_root() / "sequence.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_account(arg: str) -> str:
+    """An account's email from a number, an email or an alias."""
+    accounts = _sequence().get("accounts") or {}
+    wanted = arg.strip()
+    if wanted in accounts:
+        return accounts[wanted]["email"]
+    for record in accounts.values():
+        if wanted.lower() in (str(record.get("email", "")).lower(), str(record.get("alias", "")).lower()):
+            return record["email"]
+    # The name the band shows: the part of the email before the "@", when only one account has it.
+    named = [r["email"] for r in accounts.values() if str(r.get("email", "")).lower().split("@")[0] == wanted.lower()]
+    if len(named) == 1:
+        return named[0]
+    raise ClaudeSwitchError(f"no account {arg!r}; see `cswap list`")
+
+
+def set_per_session(on: bool) -> None:
+    state = load_state()
+    state["per_session"] = on
+    save_state(state)
+
+
+def publish_tokens() -> int:
+    """Write ``tokens.json``: the access token of every stored account that is not the active one, so
+    the proxy can bill a session that stays on an account after a switch. The active account's token
+    is the live credential, which the proxy reads itself. cswap's own usage collection keeps the stored
+    ones fresh (it refreshes under its locks); nothing is refreshed here. Returns how many were written.
+    Best effort: it never raises."""
+    try:
+        from claude_swap import oauth
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        switcher = ClaudeAccountSwitcher()
+        data = switcher._get_sequence_data() or {}
+        active = str(data.get("activeAccountNumber"))
+        entries = {}
+        for num, account in (data.get("accounts") or {}).items():
+            if num == active:
+                continue
+            blob = oauth.extract_oauth_data(switcher._read_account_credentials(num, account.get("email", "")) or "") or {}
+            if blob.get("accessToken"):
+                entries[account["email"]] = {"accessToken": blob["accessToken"], "expiresAt": blob.get("expiresAt")}
+        state_dir().mkdir(parents=True, exist_ok=True)
+        atomic_write_text(tokens_path(), json.dumps({"updated": int(time.time()), "accounts": entries}, indent=1))
+        return len(entries)
+    except Exception:
+        return 0
+
+
+def publish_tokens_after_switch() -> None:
+    """Called after ``cswap switch``: the account just left is now stored, and sessions pinned to it
+    need its token in ``tokens.json`` at once, not at the next minute."""
+    try:
+        if sys.platform == "win32" and load_state().get("per_session"):
+            publish_tokens()
+    except Exception:
+        pass
+
+
+def prune_sessions() -> int:
+    """Drop sessions not seen for a week. Returns how many went."""
+    sessions = read_sessions()
+    now = time.time()
+    keep = {}
+    for sid, entry in sessions.items():
+        try:
+            seen = time.mktime(time.strptime(entry.get("seen") or entry.get("pinned"), "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        except (TypeError, ValueError):
+            seen = now
+        if now - seen <= SESSION_MAX_IDLE_S:
+            keep[sid] = entry
+    if len(keep) != len(sessions):
+        write_sessions(keep)
+    return len(sessions) - len(keep)
+
+
+def pin_session(session: str, account: str | None, *, subagents: bool = False) -> str:
+    """Put ``session`` on ``account`` (its subagents only, when ``subagents``); ``None`` clears the
+    subagent override. Returns the account email, or an empty string when cleared."""
+    sessions = read_sessions()
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    entry = dict(sessions.get(session) or {"pinned": now})
+    email = resolve_account(account) if account else ""
+    if subagents:
+        if "account" not in entry:
+            # A session the proxy has not met yet: pin it where it is now, as its first request would.
+            seq = _sequence()
+            active = (seq.get("accounts") or {}).get(str(seq.get("activeAccountNumber")), {}).get("email")
+            if active:
+                entry["account"] = active
+        if email:
+            entry["subagents"] = email
+        else:
+            entry.pop("subagents", None)
+    else:
+        entry["account"] = email
+    entry["seen"] = now
+    sessions[session] = entry
+    write_sessions(sessions)
+    publish_tokens()
+    return email
+
+
 def _sample_usage() -> None:
     """Record cswap's newest weekly percentages for the usage report; best effort."""
     try:
@@ -328,7 +504,10 @@ def ensure(*, port: int | None = None) -> str:
         return "off"
     port = port or state.get("port") or DEFAULT_PORT
     _sample_usage()
-    if proxy_alive(port) and proxy_responsive(port):
+    if state.get("per_session"):
+        publish_tokens()
+        prune_sessions()
+    if proxy_alive(port) and proxy_responsive(port) and state.get("addon_sha", addon_sha()) == addon_sha():
         _ensure_marker()
         if state.get("failures"):
             state.pop("failures")
@@ -384,6 +563,43 @@ def state_word() -> tuple[str, str]:
     return "OK", f"proxy on {LISTEN_HOST}:{port}, variables set"
 
 
+def _run_sessions(args) -> int:
+    if args.per_session:
+        set_per_session(args.per_session == "on")
+        if args.per_session == "on":
+            publish_tokens()
+            print("Each Code tab session now keeps the account it started on. A session you have not seen yet "
+                  "is pinned to the active account when it first speaks.")
+        else:
+            print("Every Code tab session follows the active account again.")
+        return 0
+    if args.sessions:
+        sessions = read_sessions()
+        if not sessions:
+            print("No sessions yet." + ("" if load_state().get("per_session") else " (per-session mode is off: cswap desktop-follow --per-session on)"))
+            return 0
+        for sid, entry in sorted(sessions.items(), key=lambda kv: kv[1].get("seen", ""), reverse=True):
+            extra = f", subagents -> {entry['subagents']}" if entry.get("subagents") else ""
+            print(f"{sid}  {entry.get('account', '?')}{extra}  (seen {entry.get('seen', '?')})")
+        return 0
+    if args.pin:
+        email = pin_session(args.pin[0], args.pin[1])
+        print(f"Session {args.pin[0]} now bills {email}. Its next request pays a prompt-cache rebuild.")
+        return 0
+    if args.subagents:
+        target = None if args.subagents[1].lower() == "off" else args.subagents[1]
+        email = pin_session(args.subagents[0], target, subagents=True)
+        print(f"Subagents of session {args.subagents[0]} " + (f"now bill {email}." if email else "follow the session again."))
+        return 0
+    sessions = read_sessions()
+    if sessions.pop(args.unpin, None) is None:
+        print(f"No session {args.unpin}.", file=sys.stderr)
+        return 1
+    write_sessions(sessions)
+    print(f"Forgot session {args.unpin}.")
+    return 0
+
+
 def run(argv: list[str]) -> int:
     import argparse
 
@@ -401,6 +617,11 @@ def run(argv: list[str]) -> int:
     group.add_argument("--heal", action="store_true", help="Like --ensure, and say what was done")
     group.add_argument("--state", action="store_true", help="Print OK, NOT-OK or OFF, detail on stderr")
     parser.add_argument("--port", type=int, default=None, help=f"Proxy port (default {DEFAULT_PORT})")
+    group.add_argument("--per-session", choices=("on", "off"), help="on: each Code tab session keeps the account it started on; off: all follow the active account")
+    group.add_argument("--sessions", action="store_true", help="List the sessions and their accounts")
+    group.add_argument("--pin", nargs=2, metavar=("SESSION", "ACCOUNT"), help="Put a session on an account (number, email or alias)")
+    group.add_argument("--subagents", nargs=2, metavar=("SESSION", "ACCOUNT|off"), help="Send a session's subagents to an account, or off")
+    group.add_argument("--unpin", metavar="SESSION", help="Forget a session; it is pinned again to the active account when it next speaks")
     args = parser.parse_args(argv)
 
     if sys.platform != "win32":
@@ -409,6 +630,12 @@ def run(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+    if args.per_session or args.sessions or args.pin or args.subagents or args.unpin:
+        try:
+            return _run_sessions(args)
+        except ClaudeSwitchError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
     if args.ensure:
         ensure(port=args.port)
         return 0

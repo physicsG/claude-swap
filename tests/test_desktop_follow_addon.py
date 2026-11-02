@@ -98,6 +98,19 @@ def test_ledger_skips_token_counting_and_other_hosts(creds, tmp_path, monkeypatc
     assert not ledger.exists()
 
 
+def test_the_health_probe_is_answered_by_the_addon_itself(monkeypatch):
+    import sys
+    import types
+
+    made = {}
+    fake_http = types.SimpleNamespace(Response=types.SimpleNamespace(make=lambda status, body, headers: made.update(status=status, body=body) or "resp"))
+    monkeypatch.setitem(sys.modules, "mitmproxy", types.SimpleNamespace(http=fake_http))
+    monkeypatch.setitem(sys.modules, "mitmproxy.http", fake_http)
+    flow = _flow(host="cswap.invalid", path="/ping")
+    follow_active.FollowActive().request(flow)
+    assert flow.response == "resp" and made == {"status": 200, "body": b"cswap-ok"}
+
+
 def test_responses_are_streamed_not_buffered():
     # A buffered long-lived stream (Remote Control's event stream) never reaches the client.
     flow = _flow(host="example.com")
@@ -177,3 +190,115 @@ def test_shape_logging_is_off_unless_asked_and_never_logs_message_text(creds, tm
     out = capsys.readouterr().out
     assert "shape " in out and "<id>" in out and '"listening_port": 8899' in out
     assert "private words" not in out and "012345678" not in out and "Bearer" not in out
+
+
+# --- an account per session ---------------------------------------------------------------------
+
+def _per_session(monkeypatch, tmp_path, active="a@x.com", live="tok-a"):
+    """Per-session mode on, with cswap's record naming ``active`` and its token as the live one."""
+    from pathlib import Path
+
+    root = Path.home() / ".claude-swap-backup"
+    (root / "desktop-follow").mkdir(parents=True, exist_ok=True)
+    (root / "desktop-follow" / "state.json").write_text(json.dumps({"per_session": True}))
+    follow_active._STATE.update(mtime=None, per_session=False)
+    follow_active._SESSIONS.update(mtime=None, data={})
+    follow_active._TOKENS.update(mtime=None, data={})
+    follow_active._SEEN_WRITTEN.clear()
+    follow_active._CACHE.update(mtime=None, token=None)
+    set_active(active, live)
+
+
+def set_active(email, token):
+    from pathlib import Path
+    import os
+
+    (Path.home() / ".claude-swap-backup" / "sequence.json").write_text(
+        json.dumps({"activeAccountNumber": 1, "accounts": {"1": {"email": email}}}))
+    base = Path(os.environ["CLAUDE_CONFIG_DIR"])
+    (base / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": token, "expiresAt": 9_999_999_999_999}}))
+    follow_active._CACHE.update(mtime=None, token=None)
+
+
+def publish_tokens(**tokens):
+    from pathlib import Path
+
+    (Path.home() / ".claude-swap-backup" / "desktop-follow" / "tokens.json").write_text(json.dumps(
+        {"accounts": {email: {"accessToken": tok, "expiresAt": 9_999_999_999_999} for email, tok in tokens.items()}}))
+    follow_active._TOKENS.update(mtime=None, data={})
+
+
+def _request(session, klass="main", token="app-tok"):
+    flow = _flow()
+    flow.request.headers["authorization"] = f"Bearer {token}"
+    flow.request.headers["x-claude-code-session-id"] = session
+    flow.request.headers["x-claude-code-request-class"] = klass
+    follow_active.FollowActive().request(flow)
+    return flow
+
+
+def test_a_new_session_is_pinned_to_the_active_account_and_a_switch_leaves_it_alone(creds, monkeypatch, tmp_path):
+    creds()
+    _per_session(monkeypatch, tmp_path, active="a@x.com", live="tok-a")
+    first = _request("s1")
+    assert first.request.headers["authorization"] == "Bearer tok-a" and first.metadata["cswap_account"] == "a@x.com"
+    set_active("b@x.com", "tok-b")  # cswap switch
+    publish_tokens(**{"a@x.com": "tok-a2"})  # cswap publishes the account it left
+    assert _request("s1").request.headers["authorization"] == "Bearer tok-a2"  # s1 stays on a
+    later = _request("s2")  # a session started after the switch
+    assert later.request.headers["authorization"] == "Bearer tok-b" and later.metadata["cswap_account"] == "b@x.com"
+
+
+def test_a_pinned_account_without_a_usable_token_keeps_the_apps_login_and_says_so(creds, monkeypatch, tmp_path):
+    creds()
+    _per_session(monkeypatch, tmp_path, active="a@x.com", live="tok-a")
+    _request("s1")
+    set_active("b@x.com", "tok-b")  # nothing published for a
+    flow = _request("s1")
+    assert flow.request.headers["authorization"] == "Bearer app-tok"
+    assert flow.metadata["cswap_account"] is None and flow.metadata["cswap_wanted"] == "a@x.com"
+
+
+def test_an_expired_published_token_is_not_used(creds, monkeypatch, tmp_path):
+    creds()
+    _per_session(monkeypatch, tmp_path)
+    _request("s1")
+    set_active("b@x.com", "tok-b")
+    publish_tokens(**{"a@x.com": "tok-a2"})
+    assert follow_active.stored_token("a@x.com", now_ms=10_000_000_000_000) is None
+
+
+def test_subagent_requests_use_the_sessions_subagent_account(creds, monkeypatch, tmp_path):
+    creds()
+    _per_session(monkeypatch, tmp_path, active="a@x.com", live="tok-a")
+    _request("s1")
+    sessions = follow_active.load_sessions()
+    follow_active.save_sessions({**sessions, "s1": {**sessions["s1"], "subagents": "b@x.com"}})
+    publish_tokens(**{"b@x.com": "tok-b"})
+    assert _request("s1", "subagent").request.headers["authorization"] == "Bearer tok-b"
+    assert _request("s1", "main").request.headers["authorization"] == "Bearer tok-a"
+
+
+def test_the_ledger_has_session_class_and_the_wanted_account(creds, monkeypatch, tmp_path):
+    creds()
+    _per_session(monkeypatch, tmp_path, active="a@x.com", live="tok-a")
+    ledger = tmp_path / "requests.jsonl"
+    monkeypatch.setattr(follow_active, "ledger_path", lambda: ledger)
+    _request("s1")
+    set_active("b@x.com", "tok-b")
+    flow = _request("s1", "subagent")
+    follow_active.FollowActive().responseheaders(flow)
+    line = json.loads(ledger.read_text().splitlines()[-1])
+    assert line["session"] == "s1" and line["class"] == "subagent" and line["account"] is None and line["wanted"] == "a@x.com"
+
+
+def test_with_per_session_off_every_session_follows_the_active_account(creds, tmp_path):
+    from pathlib import Path
+
+    creds(token="active-tok")
+    follow_active._STATE.update(mtime=None, per_session=False)
+    (Path.home() / ".claude-swap-backup" / "desktop-follow").mkdir(parents=True, exist_ok=True)
+    (Path.home() / ".claude-swap-backup" / "desktop-follow" / "state.json").write_text(json.dumps({"enabled": True}))
+    flow = _request("s1")
+    assert flow.request.headers["authorization"] == "Bearer active-tok"
+    assert not (Path.home() / ".claude-swap-backup" / "desktop-follow" / "sessions.json").exists()

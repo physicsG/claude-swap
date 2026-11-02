@@ -127,3 +127,13 @@ def test_a_drop_in_the_percentage_counts_from_zero():
     samples = {"a@x.com": [_sample(t + "10:00:00+00:00", 20.0), _sample(t + "11:00:00+00:00", 25.0), _sample(t + "12:00:00+00:00", 3.0)]}
     (week,) = du.build_report([], samples).weeks
     assert week.week_pct()[2] == 8.0
+
+
+def test_the_ledgers_session_and_request_class_reach_the_report():
+    ledger = [{"ts": "2026-11-02T11:00:00Z", "account": "a@x.com", "request_id": "req_1", "status": 200, "session": "s1", "class": "subagent"},
+              {"ts": "2026-11-02T11:00:01Z", "account": "a@x.com", "request_id": "req_2", "status": 200}]
+    reqs = du.load_requests(ledger, {})
+    assert (reqs[0].session, reqs[0].klass) == ("s1", "subagent")
+    assert (reqs[1].session, reqs[1].klass) == ("", "")
+    page = render(du.build_report(reqs, {}))
+    assert '"c":"subagent"' in page and '"c":"main"' in page

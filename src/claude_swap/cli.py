@@ -1680,10 +1680,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
+            from claude_swap import desktop_follow
+
+            desktop_follow.publish_tokens_after_switch()
         elif args.switch_to:
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
+            from claude_swap import desktop_follow
+
+            desktop_follow.publish_tokens_after_switch()
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:

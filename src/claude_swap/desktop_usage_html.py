@@ -36,7 +36,7 @@ def payload(report: Report) -> dict:
             })
     requests = [{
         "t": _ms(r.ts), "a": r.account, "m": r.model.replace("claude-", "") or "(unknown)",
-        "p": _project(r.cwd), "k": r.counted, "e": r.entrypoint, "x": r.sidechain,
+        "p": _project(r.cwd), "k": r.counted, "e": r.entrypoint, "x": r.sidechain, "c": r.klass or "main",
         "i": r.tokens["input"], "o": r.tokens["output"], "r": r.tokens["cache_read"],
         "c5": r.tokens["cache_5m"], "c1": r.tokens["cache_1h"],
     } for r in report.requests]
@@ -125,6 +125,7 @@ details summary{cursor:pointer;color:var(--ink2)}
 <section class="grid">
 <div class="card"><h2>By model</h2><p class="sub">Input-equivalent tokens.</p><div id="models"></div></div>
 <div class="card"><h2>By project</h2><p class="sub">Input-equivalent tokens, by working folder.</p><div id="projects"></div></div>
+<div class="card"><h2>Main and subagents</h2><p class="sub">Input-equivalent tokens, by the kind of request the proxy saw.</p><div id="classes"></div></div>
 </section>
 <section class="card"><h2>Fable, its own weekly limit</h2><p class="sub">Fable has a weekly percentage of its own. Tokens here are Fable requests only.</p><div id="fabletiles" class="grid"></div><div id="fableperpct" style="margin-top:16px"></div><div id="fableline" style="margin-top:16px"></div></section>
 <section class="card"><details><summary>Table view and how to read this</summary><div id="table" style="margin-top:12px"></div><div id="notes"></div></details></section>
@@ -440,6 +441,7 @@ function render() {
   daily($('daily'), $('dailylegend'), V);
   breakdown($('models'), V, q => q.m, 7);
   breakdown($('projects'), V, q => q.p, 8);
+  breakdown($('classes'), V, q => q.c === 'subagent' ? 'subagents' : 'main session', 4);
   tiles($('fabletiles'), F, 'Fable');
   perPctChart($('fableperpct'), F);
   weekLine($('fableline'), null, F, 'f', 'Fable');

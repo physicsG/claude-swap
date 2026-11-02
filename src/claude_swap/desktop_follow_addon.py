@@ -22,6 +22,8 @@ import re
 import time
 from pathlib import Path
 
+SESSION_HEADER = "x-claude-code-session-id"
+CLASS_HEADER = "x-claude-code-request-class"
 REWRITE_PREFIX = "/v1/messages"
 API_HOST = "api.anthropic.com"
 _CACHE: dict = {"mtime": None, "token": None}
@@ -85,6 +87,142 @@ def active_token(path: Path | None = None, now_ms: float | None = None) -> str |
     if isinstance(expires_at, (int, float)) and expires_at <= now_ms + 30_000:
         return None
     return token
+
+
+def state_dir() -> Path:
+    return Path.home() / ".claude-swap-backup" / "desktop-follow"
+
+
+_STATE: dict = {"mtime": None, "per_session": False}
+
+
+def per_session_enabled() -> bool:
+    """Whether each Code tab session keeps its own account (``cswap desktop-follow --per-session on``).
+    Off, every session follows the account cswap has active, as before."""
+    path = state_dir() / "state.json"
+    try:
+        mtime = path.stat().st_mtime_ns
+        if _STATE["mtime"] != mtime:
+            _STATE["mtime"] = mtime
+            _STATE["per_session"] = bool(json.loads(path.read_text(encoding="utf-8")).get("per_session"))
+    except (OSError, ValueError, AttributeError):
+        return False
+    return _STATE["per_session"]
+
+
+_SESSIONS: dict = {"mtime": None, "data": {}}
+
+
+def load_sessions(path: Path | None = None) -> dict:
+    """``session id -> {account, subagents, pinned, seen}``, cached by mtime."""
+    path = path or state_dir() / "sessions.json"
+    try:
+        mtime = path.stat().st_mtime_ns
+    except OSError:
+        _SESSIONS.update(mtime=None, data={})
+        return _SESSIONS["data"]
+    if _SESSIONS["mtime"] != mtime:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")).get("sessions") or {}
+        except (OSError, ValueError, AttributeError):
+            data = _SESSIONS["data"]
+        _SESSIONS.update(mtime=mtime, data=data if isinstance(data, dict) else {})
+    return _SESSIONS["data"]
+
+
+def save_sessions(data: dict, path: Path | None = None) -> None:
+    """Replace the table atomically; a reader never sees half a file."""
+    path = path or state_dir() / "sessions.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"version": 1, "sessions": data}, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+    _SESSIONS.update(mtime=None)
+
+
+_SEEN_WRITTEN: dict = {}
+
+
+def account_for(session: str, request_class: str, active: str | None, path: Path | None = None) -> str | None:
+    """The account a request of ``session`` bills. A session met for the first time is pinned to the
+    active account; from then on a switch moves only sessions started later. A subagent request uses
+    the session's ``subagents`` account when it has one."""
+    if not session:
+        return active
+    sessions = load_sessions(path)
+    entry = sessions.get(session)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if entry is None:
+        if not active:
+            return None
+        sessions = dict(sessions)
+        sessions[session] = {"account": active, "pinned": now, "seen": now}
+        save_sessions(sessions, path)
+        _SEEN_WRITTEN[session] = time.time()
+        entry = sessions[session]
+    elif time.time() - _SEEN_WRITTEN.get(session, 0) > 600:
+        # Keep `seen` roughly current so idle entries can be expired; at most every ten minutes.
+        _SEEN_WRITTEN[session] = time.time()
+        sessions = dict(sessions)
+        sessions[session] = {**entry, "seen": now}
+        save_sessions(sessions, path)
+        entry = sessions[session]
+    if request_class == "subagent" and entry.get("subagents"):
+        return entry["subagents"]
+    return entry.get("account") or active
+
+
+def tokens_path() -> Path:
+    return state_dir() / "tokens.json"
+
+
+_TOKENS: dict = {"mtime": None, "data": {}}
+
+
+def stored_token(email: str, now_ms: float | None = None, path: Path | None = None) -> str | None:
+    """An unexpired access token for a stored account that is not the active one, as published by
+    cswap (``tokens.json``). None when unknown or expired: the app's own login then stays."""
+    path = path or tokens_path()
+    try:
+        mtime = path.stat().st_mtime_ns
+        if _TOKENS["mtime"] != mtime:
+            data = json.loads(path.read_text(encoding="utf-8")).get("accounts") or {}
+            _TOKENS.update(mtime=mtime, data=data if isinstance(data, dict) else {})
+    except (OSError, ValueError, AttributeError):
+        return None
+    entry = _TOKENS["data"].get(email) or {}
+    token, expires_at = entry.get("accessToken"), entry.get("expiresAt")
+    if not isinstance(token, str) or not token:
+        return None
+    now_ms = time.time() * 1000 if now_ms is None else now_ms
+    if isinstance(expires_at, (int, float)) and expires_at <= now_ms + 30_000:
+        return None
+    return token
+
+
+def token_for(email: str | None, active: str | None) -> str | None:
+    if not email:
+        return None
+    return active_token() if email == active else stored_token(email)
+
+
+def swap_for_session(host: str, path: str, headers) -> tuple[str | None, str | None]:
+    """The per-session counterpart of :func:`rewrite`. Returns ``(billed, wanted)``: the account whose
+    token now stands on the request (None when the app's own login stays) and the account the session
+    is on."""
+    if host != API_HOST or not path.startswith(REWRITE_PREFIX):
+        return None, None
+    if not headers.get("authorization", "").lower().startswith("bearer "):
+        return None, None
+    active = active_email()
+    wanted = account_for(headers.get(SESSION_HEADER, ""), headers.get(CLASS_HEADER, ""), active)
+    token = token_for(wanted, active)
+    if token is None:
+        return None, wanted
+    if headers["authorization"] != f"Bearer {token}":
+        headers["authorization"] = f"Bearer {token}"
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} cswap: bearer swapped to {wanted} (token {hashlib.sha256(token.encode()).hexdigest()[:8]})", flush=True)
+    return wanted, wanted
 
 
 def rewrite(host: str, path: str, headers) -> bool:
@@ -236,13 +374,34 @@ def record(flow, status: int | str) -> None:
             "request_id": flow.response.headers.get("request-id", "") if getattr(flow, "response", None) else "",
             "status": status,
             "entrypoint": _entrypoint(req.headers.get("user-agent", "")),
+            "session": req.headers.get(SESSION_HEADER, ""),
+            "class": req.headers.get(CLASS_HEADER, ""),
         }
+        wanted = flow.metadata.get("cswap_wanted")
+        if wanted and wanted != line["account"]:
+            line["wanted"] = wanted  # the session's account had no usable token: the app's login stood
         path = ledger_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(line) + "\n")
     except Exception:
         pass
+
+
+PING_HOST = "cswap.invalid"
+
+
+def _ping(flow) -> bool:
+    """Answer the health probe ``GET http://cswap.invalid/ping`` ourselves. A proxy whose addon was
+    unloaded (mitmproxy reloads a script whose file changes, and drops it when the reload fails)
+    still forwards every request, so it looks healthy while billing the app's login. Only a proxy
+    that has this addon answers the probe."""
+    if flow.request.pretty_host != PING_HOST:
+        return False
+    from mitmproxy import http
+
+    flow.response = http.Response.make(200, b"cswap-ok", {"content-type": "text/plain"})
+    return True
 
 
 class FollowActive:
@@ -259,10 +418,20 @@ class FollowActive:
             withdraw_marker()
 
     def request(self, flow) -> None:
-        if rewrite(flow.request.pretty_host, flow.request.path, flow.request.headers):
-            flow.comment = "cswap: billed to active account"
-        if is_inference(flow.request.pretty_host, flow.request.path):
-            flow.metadata["cswap_account"] = billed_account(flow.request.headers)
+        if _ping(flow):
+            return
+        req = flow.request
+        if is_inference(req.pretty_host, req.path) and per_session_enabled() and req.headers.get(SESSION_HEADER):
+            billed, wanted = swap_for_session(req.pretty_host, req.path, req.headers)
+            flow.metadata["cswap_account"] = billed
+            flow.metadata["cswap_wanted"] = wanted
+            if billed:
+                flow.comment = f"cswap: billed to {billed}"
+        else:
+            if rewrite(req.pretty_host, req.path, req.headers):
+                flow.comment = "cswap: billed to active account"
+            if is_inference(req.pretty_host, req.path):
+                flow.metadata["cswap_account"] = billed_account(req.headers)
         _shape(flow)
         _trace(f"> {flow.request.method} {flow.request.pretty_host}{flow.request.path.split('?')[0][:90]}")
 

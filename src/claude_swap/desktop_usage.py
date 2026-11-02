@@ -133,6 +133,7 @@ class Request:
     cwd: str = ""
     session: str = ""
     entrypoint: str = ""
+    klass: str = ""  # the request class the proxy saw: "main" or "subagent"
     sidechain: bool = False
     counted: bool = False  # tokens known: the request id was found in a transcript
 
@@ -202,7 +203,8 @@ def load_requests(ledger: list[dict] | None = None, transcripts: dict[str, dict]
         if rid and rid in seen:
             continue
         seen.add(rid)
-        req = Request(parse_time(row["ts"]), row.get("account"), rid, row.get("status"), entrypoint=row.get("entrypoint") or "")
+        req = Request(parse_time(row["ts"]), row.get("account"), rid, row.get("status"), entrypoint=row.get("entrypoint") or "", klass=row.get("class") or "")
+        req.session = row.get("session") or ""  # transcripts overwrite it with the same id when found
         found = transcripts.get(rid)
         if found:
             req.tokens, req.model, req.cwd, req.session = found["tokens"], found["model"], found["cwd"], found["session"]

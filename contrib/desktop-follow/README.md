@@ -25,6 +25,7 @@ Start a new Code session afterwards. Running sessions keep their old connection.
 | `cswap desktop-follow --state` | Print `OK`, `NOT-OK` or `OFF`; detail on stderr. |
 | `cswap desktop-follow --heal` | Restart a dead or wedged proxy. After five failed restarts in a row (one a minute, so a slow start after sleep is tolerated) remove the variables so sessions go direct instead of failing, and say so. |
 | `cswap desktop-follow --ensure` | The same, silently. This is what the task runs. |
+| `cswap desktop-follow --per-session on` | Each Code tab session keeps the account it started on, instead of all following the active one. Then `--sessions`, `--pin SESSION ACCOUNT`, `--subagents SESSION ACCOUNT\|off`, `--unpin SESSION` (see DESIGN.md). Off by default. |
 
 Design notes, incident log and the open designs (an account per project, an account per subagent): [DESIGN.md](DESIGN.md).
 

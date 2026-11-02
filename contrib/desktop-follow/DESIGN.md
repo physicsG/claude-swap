@@ -13,8 +13,8 @@ for whoever picks this up next, human or agent. Start with the status table.
 | 4 | The credential decides the active account | committed, branch `fix/credential-owns-active`, no PR yet | `switcher.py` (`live_credential_owner`, `reconcile_identity`) |
 | 5 | The account bar (swap-meter) | shipped, PR RomanovX/claude-mods#1 | `claude-mods/plugins/swap-meter/hooks` |
 | 6 | What a switch costs (cache rebuild) | measured | section 6 |
-| 7 | **An account per session (and so per project)** | **designed; spikes S1, S4, S6 done, S5 answered, build not started** | section 7, mockup `mockups/account-bar.html` |
-| 8 | **Subagents on another account** | **designed (nice to have); identification verified** | section 8 |
+| 7 | **An account per session (and so per project)** | **proxy and cswap side built and verified live, off by default; the bar is not built** | section 7, mockup `mockups/account-bar.html` |
+| 8 | **Subagents on another account** | **built (manual, per session) and verified live; no automatic rule** | section 8 |
 
 Commands you will need: `cswap desktop-follow --on|--off|--state|--heal`,
 `cswap usage-report --open`. Everything lives under `~\.claude-swap-backup\desktop-follow\`
@@ -72,6 +72,8 @@ Each of these was observed, not guessed.
 | `--off` left a proxy running | A start that timed out wrote the stale pid back over the new proxy's pid | Reload state before saving the failure |
 | Proxy "up" but every request stalls | A hung proxy still accepts connections (the kernel queues them), so a connect check passes | `proxy_responsive()` sends a request and wants an `HTTP/` reply; `--state` and `--ensure` use it |
 | `uv tool install --force` fails with "Access is denied" and leaves cswap broken (`No module named claude_swap`) | The minute task's `pythonw.exe` lives in the tool's `Scripts` folder and holds it while it runs | Retry the install a few times; the proxy and the task come back once it succeeds |
+| Proxy "OK" but billing nothing: probes forwarded unchanged, ledger silent | mitmproxy watches the script file it was given and reloads it when the file changes. `uv tool install --force` rewrites the installed addon, a failed reload drops the addon, and the proxy keeps forwarding every request with the app's login while a connect or an ordinary request looks healthy | The proxy runs from a staged copy (`addon_running.py` in the state folder); the health probe is answered by the addon itself (`GET http://cswap.invalid/ping` returns `cswap-ok`); `--ensure` restarts the proxy when the installed addon's hash differs from the one it started with, so a reinstall takes effect within a minute |
+| A restart did nothing: the old proxy kept the port | `stop_proxy` only killed the pid in `state.json`, which goes stale, and `start_proxy` returns at once when the port answers | `stop_proxy` also kills any mitmdump of ours on the port, found by command line |
 | Band showed the wrong account as billed | The marker file went missing: a second proxy that failed to bind the port exited through `done()` and withdrew the running one's marker | Only the instance that published the marker withdraws it; `--ensure` puts it back |
 
 Debugging aid: create the file `desktop-follow\trace` and the proxy logs method, host,
@@ -221,6 +223,30 @@ per Code tab environment). It would work for launch-time choices but cannot move
 session, and needs per-project setup. The port is still useful as an escape hatch.
 Rejected: a different proxy process per account; `cswap run` for the Code tab (terminal only; it
 and `cswap map` remain the way to bind a folder to an account for terminal sessions).
+
+### Built (proxy and cswap side), verified live
+
+Off by default; `cswap desktop-follow --per-session on|off` turns it on or off (a flag in
+`state.json`). With it on:
+
+- The addon pins each new session on first sight (`sessions.json`), resolves each request's account
+  from the table, takes that account's token from the live credential (the active account) or from
+  `tokens.json` (any other), and leaves the app's login on the request when no usable token exists,
+  recording the account it wanted as `wanted` in the ledger. Ledger lines now carry `session` and
+  `class`.
+- `cswap desktop-follow --sessions`, `--pin SESSION ACCOUNT`, `--subagents SESSION ACCOUNT|off`,
+  `--unpin SESSION`. An account is a number, an email, an alias, or the name the band shows (the
+  part before the `@`). The minute task publishes `tokens.json` and drops sessions idle for a week;
+  `cswap switch` publishes it at once.
+- Live check: with this session's subagents set to gordian-claude, a subagent's calls were billed to
+  gordian-claude (its token) while the same session's main-loop calls stayed on gordian.zomer,
+  each ledger line naming the account, class and session. Not yet checked live: moving the main loop
+  of a session (the bar's click) and its cache cost.
+- The usage report gains a "Main and subagents" block.
+- Not built: the bar (click to move this session, per-session dots, subagent chip), the activity feed
+  (`activity.json`) for the counts, and any automatic subagent rule. Until the bar exists, per-session
+  mode is switched off after testing: with it on, `cswap switch` and the bar's click would only move
+  sessions started afterwards.
 
 ## 8. Subagents on another account (nice to have)
 
