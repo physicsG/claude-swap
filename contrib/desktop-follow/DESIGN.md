@@ -13,7 +13,7 @@ for whoever picks this up next, human or agent. Start with the status table.
 | 4 | The credential decides the active account | committed, branch `fix/credential-owns-active`, no PR yet | `switcher.py` (`live_credential_owner`, `reconcile_identity`) |
 | 5 | The account bar (swap-meter) | shipped, PR RomanovX/claude-mods#1 | `claude-mods/plugins/swap-meter/hooks` |
 | 6 | What a switch costs (cache rebuild) | measured | section 6 |
-| 7 | **An account per session (and so per project)** | **designed; spikes S1 and S4 done, build not started** | section 7, mockup `mockups/account-bar.html` |
+| 7 | **An account per session (and so per project)** | **designed; spikes S1, S4, S6 done, S5 answered, build not started** | section 7, mockup `mockups/account-bar.html` |
 | 8 | **Subagents on another account** | **designed (nice to have); identification verified** | section 8 |
 
 Commands you will need: `cswap desktop-follow --on|--off|--state|--heal`,
@@ -256,12 +256,18 @@ fingerprinting of system prompts is needed.
 - **S2 not needed** unless the proxy-login labelling comes back.
 - **S3 open** (only matters for the port escape hatch): which `HTTPS_PROXY` wins when both the
   global `env` block and a Code tab environment set it.
-- **S5 open:** can cswap hand the proxy fresh tokens for inactive accounts through its existing
-  locked refresh path without stranding a refresh token that `cswap run` also uses? Decides how
-  `tokens.json` is produced. This is the main risk of the whole design.
-- **S6 open:** does the swap-meter plugin know its own session id (an API on `$`, or the
-  `CLAUDE_CODE_SESSION_ID` environment)? Without it the bar cannot say which row is "this session"
-  or move it. It must equal the header value.
+- **S5 mostly answered.** cswap already refreshes every stored slot under its own locks whenever it
+  collects usage (`_collect_usage_entries`, which `cswap list`, the TUI, the menu bar and `cswap auto`
+  all run, and the band runs `cswap list --json` every minute). Checked on this machine: both
+  stored accounts hold a non-expired access token (about 2.3 h left) and a refresh token. So
+  `tokens.json` needs no new refresh path: after the collection, read each slot's backup
+  credential (`_read_account_credentials`) and write access token plus `expiresAt`; the active
+  slot comes from the live credential. Remaining risk: an inactive slot's token is only as fresh
+  as the last collection, and the proxy must treat an expired one as "unknown" (the request keeps
+  the app's login) and the bar must say so.
+- **S6 done.** The plugin API has `$.session.id()`, "the session's id (the transcript file's
+  name)". This session's id hashes to the same tag the proxy logged for its requests (`01b3a2`),
+  so the bar can identify its own session and write the right row of `sessions.json`.
 - **S7 open:** is `x-claude-code-prompt-id` per prompt, and is there a per-subagent id anywhere
   (headers, body `thread`)?
 - Whether Claude Desktop is the writer of `oauthAccount` (design 4) is inferred, not seen.
