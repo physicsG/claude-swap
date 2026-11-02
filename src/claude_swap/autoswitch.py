@@ -1077,6 +1077,7 @@ class AutoSwitchEngine:
             else {}
         )
 
+        self.switcher.reconcile_identity()
         current = self.switcher.current_account_number()
         # A tick with no managed active account keeps the current context;
         # a different account reseeds from the state file so its counts are

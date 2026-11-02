@@ -151,7 +151,9 @@ class EngineHarness:
 
     def make_live(self, email: str, num: int) -> None:
         (self.temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+            # The login's own token pair: a live credential that is another slot's stored
+            # one reads as that slot's login, whatever ``.claude.json`` says.
+            "claudeAiOauth": {"accessToken": f"sk-live-{num}", "refreshToken": f"rt-live-{num}"},
         }))
         (self.temp_home / ".claude.json").write_text(json.dumps({
             "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},

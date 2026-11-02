@@ -1629,6 +1629,16 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
+        # ~/.claude.json can name another account than the live credential (Claude
+        # Desktop writes its own login there); put it right before reading or switching.
+        if args.list or args.switch or args.switch_to or args.status:
+            repaired = switcher.reconcile_identity()
+            if repaired and not args.json:
+                print(dimmed(
+                    f"Repaired ~/.claude.json: it named Account-{repaired[0]}, "
+                    f"but the live login belongs to Account-{repaired[1]}."
+                ))
+
         if args.add_account:
             switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:

@@ -2147,7 +2147,115 @@ class ClaudeAccountSwitcher:
             return None
         data = self._get_sequence_data() or {}
         email, org_uuid = identity
-        return self._find_account_slot(data, email, org_uuid)
+        config_slot = self._find_account_slot(data, email, org_uuid)
+        # The login is the credential, not the label on it: Claude Desktop rewrites
+        # ``oauthAccount`` with its own login when a Code session starts, so the file can
+        # name one slot while the live credential belongs to another. Only a credential
+        # that provably belongs to a managed slot overrides the file.
+        owner = self.live_credential_owner()
+        if owner is None or owner == config_slot or config_slot is None:
+            return config_slot
+        # The file's own slot must hold a stored credential that the live one is not: with
+        # nothing stored there is no evidence against the file, which stays the answer.
+        try:
+            stored = self._read_account_credentials(
+                config_slot, data["accounts"][config_slot].get("email", "")
+            )
+        except Exception:
+            return config_slot
+        return owner if stored else config_slot
+
+    def live_credential_owner(self, *, allow_network: bool = False) -> str | None:
+        """The managed slot whose credential is the live one, judged by the credential.
+
+        Cheap path: the live credential's lineage fingerprint (refresh-token hash, so it
+        survives access-token rotation) equals a slot backup's. With ``allow_network`` the
+        profile oracle (``fetch_oauth_profile``) answers for a credential whose refresh
+        token rotated since its backup; never call that while a lock is held. ``None``
+        means unknown, never "wrong": callers then keep trusting ``~/.claude.json``.
+        """
+        try:
+            creds = self._read_credentials()
+        except Exception:
+            return None
+        fingerprint = oauth.credential_fingerprint(creds or "")
+        if not fingerprint:
+            return None
+        memo = self.__dict__.setdefault("_owner_memo", {})
+        if fingerprint in memo:
+            return memo[fingerprint]
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        matching = []
+        for num, account in accounts.items():
+            try:
+                backup = self._read_account_credentials(num, account.get("email", ""))
+            except Exception:
+                continue
+            if backup and oauth.credential_fingerprint(backup) == fingerprint:
+                matching.append(num)
+        if len(matching) == 1:
+            memo[fingerprint] = matching[0]
+            return matching[0]
+        if matching:
+            return None  # two slots share the lineage: that proves nothing about either
+        if not allow_network:
+            return None
+        # A failed probe is not repeated for five minutes: this runs from loops.
+        failed = self.__dict__.setdefault("_owner_failed", {})
+        if time.monotonic() - failed.get(fingerprint, -1e9) < 300:
+            return None
+        token = oauth.extract_access_token(creds or "")
+        resolved = oauth.fetch_oauth_profile(token) if token else None
+        if resolved is not None:
+            for num in accounts:
+                if self._resolved_matches_slot_identity(num, resolved) is True:
+                    memo[fingerprint] = num
+                    return num
+        failed[fingerprint] = time.monotonic()
+        return None
+
+    def reconcile_identity(self) -> tuple[str, str] | None:
+        """Make ``~/.claude.json`` name the account the live credential belongs to.
+
+        Returns ``(from_slot, to_slot)`` when it rewrote ``oauthAccount`` (and the recorded
+        active slot), ``None`` when nothing needed doing or the owner could not be proved.
+        Best effort and quiet: it never raises, so a read-only command is never failed by it.
+        """
+        try:
+            identity = self._get_current_account()
+            if identity is None:
+                return None
+            data = self._get_sequence_data() or {}
+            config_slot = self._find_account_slot(data, identity[0], identity[1])
+            owner = self.live_credential_owner(allow_network=True)
+            if owner is None or owner == config_slot:
+                return None
+            email = data["accounts"][owner]["email"]
+            with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+                # Under the locks: the credential must still be the one we judged, and the
+                # file must not have been rewritten for the same slot in the meantime.
+                live = oauth.credential_fingerprint(self._read_credentials() or "")
+                if live is None or self.__dict__.get("_owner_memo", {}).get(live) != owner:
+                    return None
+                oauth_section = json.loads(self._read_account_config(owner, email)).get("oauthAccount")
+                config_path = self._get_claude_config_path()
+                current = self._read_json(config_path)
+                if not oauth_section or current is None:
+                    return None
+                current["oauthAccount"] = oauth_section
+                self._write_json(config_path, current)
+                seq = self._get_sequence_data() or {}
+                seq["activeAccountNumber"] = int(owner)
+                seq["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, seq)
+            self._logger.info(
+                "Repaired ~/.claude.json: it named Account-%s but the live credential belongs to Account-%s",
+                config_slot, owner,
+            )
+            return (str(config_slot), owner)
+        except Exception as exc:
+            self._logger.debug("Identity reconcile skipped: %s", exc)
+            return None
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
