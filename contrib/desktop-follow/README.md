@@ -26,6 +26,8 @@ Start a new Code session afterwards. Running sessions keep their old connection.
 | `cswap desktop-follow --heal` | Restart a dead or wedged proxy. After five failed restarts in a row (one a minute, so a slow start after sleep is tolerated) remove the variables so sessions go direct instead of failing, and say so. |
 | `cswap desktop-follow --ensure` | The same, silently. This is what the task runs. |
 
+Design notes, incident log and the open designs (an account per project, an account per subagent): [DESIGN.md](DESIGN.md).
+
 ## What the proxy changes
 
 Only the bearer on `/v1/messages`, swapped for the active account's access token
