@@ -176,6 +176,38 @@ def tokens_path() -> Path:
     return state_dir() / "tokens.json"
 
 
+_ACTIVITY: dict = {"sessions": {}, "flushed": 0.0}
+ACTIVITY_FLUSH_S = 3.0
+ACTIVITY_KEEP_S = 600.0
+
+
+def note_activity(session: str, request_class: str, account: str | None, now: float | None = None, path: Path | None = None) -> None:
+    """Remember which account each session's main loop and subagents last billed, and write it to
+    ``activity.json`` (at most every few seconds) for the account bar's counts."""
+    if not session or not account:
+        return
+    now = time.time() if now is None else now
+    kind = "subagent" if request_class == "subagent" else "main"
+    _ACTIVITY["sessions"].setdefault(session, {})[kind] = {"account": account, "t": now}
+    if now - _ACTIVITY["flushed"] < ACTIVITY_FLUSH_S:
+        return
+    _ACTIVITY["flushed"] = now
+    live = {}
+    for sid, kinds in _ACTIVITY["sessions"].items():
+        kept = {k: v for k, v in kinds.items() if now - v["t"] <= ACTIVITY_KEEP_S}
+        if kept:
+            live[sid] = kept
+    _ACTIVITY["sessions"] = live
+    try:
+        target = path or state_dir() / "activity.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"updated": now, "sessions": live}), encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        pass
+
+
 _TOKENS: dict = {"mtime": None, "data": {}}
 
 
@@ -423,6 +455,7 @@ class FollowActive:
         req = flow.request
         if is_inference(req.pretty_host, req.path) and per_session_enabled() and req.headers.get(SESSION_HEADER):
             billed, wanted = swap_for_session(req.pretty_host, req.path, req.headers)
+            note_activity(req.headers.get(SESSION_HEADER, ""), req.headers.get(CLASS_HEADER, ""), wanted)
             flow.metadata["cswap_account"] = billed
             flow.metadata["cswap_wanted"] = wanted
             if billed:

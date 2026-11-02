@@ -302,3 +302,33 @@ def test_with_per_session_off_every_session_follows_the_active_account(creds, tm
     flow = _request("s1")
     assert flow.request.headers["authorization"] == "Bearer active-tok"
     assert not (Path.home() / ".claude-swap-backup" / "desktop-follow" / "sessions.json").exists()
+
+
+def test_activity_records_the_last_account_of_each_session_and_class(tmp_path):
+    follow_active._ACTIVITY.update(sessions={}, flushed=0.0)
+    out = tmp_path / "activity.json"
+    follow_active.note_activity("s1", "main", "a@x.com", now=1000.0, path=out)
+    follow_active.note_activity("s1", "subagent", "b@x.com", now=1001.0, path=out)  # inside the flush gap
+    assert json.loads(out.read_text())["sessions"] == {"s1": {"main": {"account": "a@x.com", "t": 1000.0}}}
+    follow_active.note_activity("s2", "main", "b@x.com", now=1010.0, path=out)
+    data = json.loads(out.read_text())["sessions"]
+    assert data["s1"]["subagent"]["account"] == "b@x.com" and data["s2"]["main"]["account"] == "b@x.com"
+
+
+def test_activity_forgets_sessions_idle_for_ten_minutes(tmp_path):
+    follow_active._ACTIVITY.update(sessions={}, flushed=0.0)
+    out = tmp_path / "activity.json"
+    follow_active.note_activity("old", "main", "a@x.com", now=1000.0, path=out)
+    follow_active.note_activity("new", "main", "a@x.com", now=2000.0, path=out)
+    assert set(json.loads(out.read_text())["sessions"]) == {"new"}
+
+
+def test_a_request_in_per_session_mode_feeds_the_activity_file(creds, monkeypatch, tmp_path):
+    creds()
+    _per_session(monkeypatch, tmp_path, active="a@x.com", live="tok-a")
+    follow_active._ACTIVITY.update(sessions={}, flushed=0.0)
+    _request("s1")
+    from pathlib import Path
+
+    written = json.loads((Path.home() / ".claude-swap-backup" / "desktop-follow" / "activity.json").read_text())
+    assert written["sessions"]["s1"]["main"]["account"] == "a@x.com"
