@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -146,13 +147,18 @@ def transcript_root() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
 
 
-def read_transcripts(root: Path | None = None, only_ids: set[str] | None = None) -> dict[str, dict]:
+_REQUEST_ID = re.compile(r'"requestId"\s*:\s*"([^"]+)"')
+
+
+def read_transcripts(root: Path | None = None, only_ids: set[str] | None = None, since: float | None = None) -> dict[str, dict]:
     """Final usage per request id. A request writes one transcript line per content block, all with
     the same usage, and a resumed session repeats old lines, so the fullest line per id wins."""
     root = root or transcript_root()
     found: dict[str, dict] = {}
     for file in root.rglob("*.jsonl"):
         try:
+            if since is not None and file.stat().st_mtime < since:
+                continue
             handle = file.open(encoding="utf-8", errors="ignore")
         except OSError:
             continue
@@ -160,8 +166,10 @@ def read_transcripts(root: Path | None = None, only_ids: set[str] | None = None)
             for line in handle:
                 if '"requestId"' not in line:
                     continue
-                if only_ids is not None and not any(i in line for i in only_ids):
-                    continue
+                if only_ids is not None:
+                    match = _REQUEST_ID.search(line)
+                    if not match or match.group(1) not in only_ids:
+                        continue
                 try:
                     row = json.loads(line)
                 except ValueError:
@@ -196,7 +204,11 @@ def read_transcripts(root: Path | None = None, only_ids: set[str] | None = None)
 def load_requests(ledger: list[dict] | None = None, transcripts: dict[str, dict] | None = None) -> list[Request]:
     ledger = read_jsonl(ledger_path()) if ledger is None else ledger
     if transcripts is None:
-        transcripts = read_transcripts(only_ids={r["request_id"] for r in ledger if r.get("request_id")})
+        starts = [parse_time(r["ts"]).timestamp() for r in ledger if r.get("ts")]
+        transcripts = read_transcripts(
+            only_ids={r["request_id"] for r in ledger if r.get("request_id")},
+            since=min(starts) - 86400 if starts else None,
+        )
     out, seen = [], set()
     for row in ledger:
         rid = row.get("request_id") or ""
