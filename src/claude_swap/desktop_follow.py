@@ -16,6 +16,7 @@ sessions fall back to a direct connection instead of failing.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -74,16 +75,69 @@ def wanted_env(port: int) -> dict[str, str]:
 
 
 def load_state() -> dict:
-    try:
-        data = json.loads(_state_file().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    """The state file; {} when it is missing. On Windows a reader can briefly fail to open a file
+    that is being replaced, and an empty answer reads as "turned off", so retry before giving up."""
+    for attempt in range(4):
+        try:
+            data = json.loads(_state_file().read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            time.sleep(0.05 * (attempt + 1))
+    return {}
 
 
 def save_state(state: dict) -> None:
     state_dir().mkdir(parents=True, exist_ok=True)
     atomic_write_text(_state_file(), json.dumps(state, indent=2) + "\n")
+
+
+@contextlib.contextmanager
+def _state_lock(timeout: float = 10.0):
+    """One writer at a time across the proxy-starting task, the CLI and the band. A lock left by a
+    crashed writer is taken over after ``timeout``."""
+    state_dir().mkdir(parents=True, exist_ok=True)
+    lock = state_dir() / "state.lock"
+    deadline = time.time() + timeout
+    while True:
+        try:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            break
+        except FileExistsError:
+            if time.time() > deadline:
+                break
+            time.sleep(0.05)
+        except OSError:
+            break
+    try:
+        yield
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+def update_state(change) -> dict:
+    """Read, change and write the state under the lock, so a writer holding an older copy cannot
+    erase what another just saved. ``change`` edits the dict in place."""
+    with _state_lock():
+        state = load_state()
+        change(state)
+        save_state(state)
+        return state
+
+
+def _per_session_file() -> Path:
+    return state_dir() / "per-session"
+
+
+def per_session_on() -> bool:
+    """The per-session choice lives in its own file, apart from ``state.json``, which gets rewritten
+    from scratch when it is found empty (after a reboot, say). ``state.json``'s old ``per_session``
+    key still counts."""
+    return _per_session_file().exists() or bool(load_state().get("per_session"))
 
 
 def proxy_responsive(port: int, timeout: float = 3.0) -> bool:
@@ -314,9 +368,7 @@ def turn_on(port: int = DEFAULT_PORT) -> None:
         return config
 
     _edit_global_config(edit)
-    state = load_state()
-    state.update(enabled=True, port=port, wrote=wrote)
-    save_state(state)
+    update_state(lambda state: state.update(enabled=True, port=port, wrote=wrote))
     install_task()
 
 
@@ -392,9 +444,12 @@ def resolve_account(arg: str) -> str:
 
 
 def set_per_session(on: bool) -> None:
-    state = load_state()
-    state["per_session"] = on
-    save_state(state)
+    state_dir().mkdir(parents=True, exist_ok=True)
+    if on:
+        atomic_write_text(_per_session_file(), "on\n")
+    else:
+        _per_session_file().unlink(missing_ok=True)
+    update_state(lambda state: state.pop("per_session", None))
 
 
 def publish_tokens() -> int:
@@ -428,7 +483,7 @@ def publish_tokens_after_switch() -> None:
     """Called after ``cswap switch``: the account just left is now stored, and sessions pinned to it
     need its token in ``tokens.json`` at once, not at the next minute."""
     try:
-        if sys.platform == "win32" and load_state().get("per_session"):
+        if sys.platform == "win32" and per_session_on():
             publish_tokens()
     except Exception:
         pass
@@ -504,22 +559,19 @@ def ensure(*, port: int | None = None) -> str:
         return "off"
     port = port or state.get("port") or DEFAULT_PORT
     _sample_usage()
-    if state.get("per_session"):
+    if per_session_on():
         publish_tokens()
         prune_sessions()
     if proxy_alive(port) and proxy_responsive(port) and state.get("addon_sha", addon_sha()) == addon_sha():
         _ensure_marker()
         if state.get("failures"):
-            state.pop("failures")
-            save_state(state)
+            update_state(lambda st: st.pop("failures", None))
         return "ok"
     try:
         # A proxy that no longer listens may still be running, wedged; kill it first.
         stop_proxy()
         start_proxy(port)
-        state = load_state()
-        state.pop("failures", None)
-        save_state(state)
+        update_state(lambda st: st.pop("failures", None))
         return "restarted"
     except Exception:
         # start_proxy records the new pid before it waits for the port; reload so a start that
@@ -576,7 +628,7 @@ def _run_sessions(args) -> int:
     if args.sessions:
         sessions = read_sessions()
         if not sessions:
-            print("No sessions yet." + ("" if load_state().get("per_session") else " (per-session mode is off: cswap desktop-follow --per-session on)"))
+            print("No sessions yet." + ("" if per_session_on() else " (per-session mode is off: cswap desktop-follow --per-session on)"))
             return 0
         for sid, entry in sorted(sessions.items(), key=lambda kv: kv[1].get("seen", ""), reverse=True):
             extra = f", subagents -> {entry['subagents']}" if entry.get("subagents") else ""

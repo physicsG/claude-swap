@@ -1,5 +1,6 @@
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -317,11 +318,46 @@ def test_account_arguments_resolve_by_number_email_and_alias(home):
         df.resolve_account("nobody")
 
 
-def test_per_session_mode_is_a_state_flag(home):
+def test_per_session_mode_is_its_own_file(home):
     df.set_per_session(True)
-    assert df.load_state()["per_session"] is True
+    assert df.per_session_on()
     df.set_per_session(False)
-    assert df.load_state()["per_session"] is False
+    assert not df.per_session_on()
+
+
+def test_per_session_mode_survives_a_rewritten_state_file(home):
+    df.set_per_session(True)
+    df.save_state({})  # what an empty state file turns into after a reboot
+    df.update_state(lambda st: st.update(enabled=True, port=9))
+    assert df.per_session_on()
+
+
+def test_the_old_state_key_still_turns_the_mode_on(home):
+    df.save_state({"enabled": True, "per_session": True})
+    assert df.per_session_on()
+
+
+def test_update_state_keeps_what_another_writer_saved(home):
+    df.save_state({"enabled": True, "port": 1})
+    stale = df.load_state()
+    df.update_state(lambda st: st.update(pid=7))
+    df.update_state(lambda st: st.pop("failures", None))
+    assert df.load_state() == {"enabled": True, "port": 1, "pid": 7}
+    assert stale == {"enabled": True, "port": 1}
+
+
+def test_load_state_retries_a_file_that_is_briefly_unreadable(home, monkeypatch):
+    df.save_state({"enabled": True})
+    real, calls = Path.read_text, []
+
+    def flaky(self, *a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            raise PermissionError("locked")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    assert df.load_state() == {"enabled": True}
 
 
 def test_pin_and_unpin_a_session_and_its_subagents(home, monkeypatch):

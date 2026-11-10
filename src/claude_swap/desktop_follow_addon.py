@@ -98,7 +98,10 @@ _STATE: dict = {"mtime": None, "per_session": False}
 
 def per_session_enabled() -> bool:
     """Whether each Code tab session keeps its own account (``cswap desktop-follow --per-session on``).
-    Off, every session follows the account cswap has active, as before."""
+    Off, every session follows the account cswap has active, as before. The choice is the file
+    ``per-session``; ``state.json``'s old ``per_session`` key still counts."""
+    if (state_dir() / "per-session").exists():
+        return True
     path = state_dir() / "state.json"
     try:
         mtime = path.stat().st_mtime_ns
@@ -106,15 +109,20 @@ def per_session_enabled() -> bool:
             _STATE["mtime"] = mtime
             _STATE["per_session"] = bool(json.loads(path.read_text(encoding="utf-8")).get("per_session"))
     except (OSError, ValueError, AttributeError):
-        return False
+        return _STATE["per_session"]
     return _STATE["per_session"]
 
 
 _SESSIONS: dict = {"mtime": None, "data": {}}
+_PENDING: dict = {}  # sessions met but not yet saved because the file was locked
 
 
 def load_sessions(path: Path | None = None) -> dict:
     """``session id -> {account, subagents, pinned, seen}``, cached by mtime."""
+    return {**_PENDING, **_load_sessions_file(path)}
+
+
+def _load_sessions_file(path: Path | None = None) -> dict:
     path = path or state_dir() / "sessions.json"
     try:
         mtime = path.stat().st_mtime_ns
@@ -136,8 +144,20 @@ def save_sessions(data: dict, path: Path | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps({"version": 1, "sessions": data}, indent=1), encoding="utf-8")
-    os.replace(tmp, path)
+    for attempt in range(6):  # on Windows the target is briefly locked while a reader has it open
+        try:
+            os.replace(tmp, path)
+            break
+        except OSError:
+            if attempt == 5:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            time.sleep(0.05 * (attempt + 1))
     _SESSIONS.update(mtime=None)
+    _PENDING.clear()
 
 
 _SEEN_WRITTEN: dict = {}
@@ -157,7 +177,10 @@ def account_for(session: str, request_class: str, active: str | None, path: Path
             return None
         sessions = dict(sessions)
         sessions[session] = {"account": active, "pinned": now, "seen": now}
-        save_sessions(sessions, path)
+        try:
+            save_sessions(sessions, path)
+        except OSError:
+            _PENDING[session] = sessions[session]  # keep it in memory; the next save writes it out
         _SEEN_WRITTEN[session] = time.time()
         entry = sessions[session]
     elif time.time() - _SEEN_WRITTEN.get(session, 0) > 600:
@@ -165,7 +188,10 @@ def account_for(session: str, request_class: str, active: str | None, path: Path
         _SEEN_WRITTEN[session] = time.time()
         sessions = dict(sessions)
         sessions[session] = {**entry, "seen": now}
-        save_sessions(sessions, path)
+        try:
+            save_sessions(sessions, path)
+        except OSError:
+            pass  # only `seen` is stale; the pin itself is untouched
         entry = sessions[session]
     if request_class == "subagent" and entry.get("subagents"):
         return entry["subagents"]

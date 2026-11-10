@@ -268,6 +268,29 @@ def test_an_expired_published_token_is_not_used(creds, monkeypatch, tmp_path):
     assert follow_active.stored_token("a@x.com", now_ms=10_000_000_000_000) is None
 
 
+def test_a_session_file_that_cannot_be_saved_does_not_cost_the_request_its_account(creds, monkeypatch, tmp_path):
+    creds()
+    _per_session(monkeypatch, tmp_path, active="a@x.com", live="tok-a")
+
+    def locked(src, dst):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(follow_active.os, "replace", locked)
+    monkeypatch.setattr(follow_active.time, "sleep", lambda s: None)
+    assert follow_active.account_for("s9", "main", "a@x.com") == "a@x.com"
+    assert follow_active.account_for("s9", "main", "b@x.com") == "a@x.com"  # still pinned in memory
+
+
+def test_the_per_session_file_turns_the_mode_on_without_the_state_key(monkeypatch, tmp_path):
+    root = tmp_path / ".claude-swap-backup"
+    (root / "desktop-follow").mkdir(parents=True)
+    monkeypatch.setattr(follow_active.Path, "home", classmethod(lambda cls: tmp_path))
+    follow_active._STATE.update(mtime=None, per_session=False)
+    assert not follow_active.per_session_enabled()
+    (root / "desktop-follow" / "per-session").write_text("on")
+    assert follow_active.per_session_enabled()
+
+
 def test_subagent_requests_use_the_sessions_subagent_account(creds, monkeypatch, tmp_path):
     creds()
     _per_session(monkeypatch, tmp_path, active="a@x.com", live="tok-a")
