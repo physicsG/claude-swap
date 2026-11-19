@@ -21,11 +21,15 @@ def _project(cwd: str) -> str:
     return leaf or "(unknown)"
 
 
-def payload(report: Report) -> dict:
+def payload(report: Report, days: int = 0) -> dict:
+    """The data the page draws, for the last ``days`` days (0: all of it)."""
+    since = _ms(report.generated) - days * 86_400_000 if days else 0
     accounts = sorted({s for s in report.samples} | {r.account for r in report.requests if r.account})
     samples = []
     for account, rows in report.samples.items():
         for s in rows:
+            if _ms(s.ts) < since:
+                continue
             samples.append({
                 "t": _ms(s.ts), "a": account,
                 "w": s.week["pct"] if s.week else None,
@@ -39,10 +43,12 @@ def payload(report: Report) -> dict:
         "p": _project(r.cwd), "k": r.counted, "e": r.entrypoint, "x": r.sidechain, "c": r.klass or "main",
         "i": r.tokens["input"], "o": r.tokens["output"], "r": r.tokens["cache_read"],
         "c5": r.tokens["cache_5m"], "c1": r.tokens["cache_1h"],
-    } for r in report.requests]
+    } for r in report.requests if _ms(r.ts) >= since]
+    first = min((q["t"] for q in requests), default=None)
     return {
         "generated": _ms(report.generated),
-        "first": _ms(report.first_request) if report.first_request else None,
+        "first": first,
+        "days": days,
         "accounts": [{"email": a, "name": a.split("@")[0]} for a in accounts],
         "weights": WEIGHTS,
         "samples": sorted(samples, key=lambda s: s["t"]),
@@ -50,9 +56,15 @@ def payload(report: Report) -> dict:
     }
 
 
-def render(report: Report) -> str:
-    data = json.dumps(payload(report), separators=(",", ":")).replace("</", "<\\/")
-    return TEMPLATE.replace("__DATA__", data)
+def data_script(report: Report, days: int = 0) -> str:
+    """The data file: a script that sets ``window.USAGE_DATA``. A script rather than JSON because a
+    page opened from disk may load a script from its own folder but not fetch a JSON file."""
+    return "window.USAGE_DATA = " + json.dumps(payload(report, days), separators=(",", ":")) + ";\n"
+
+
+def render(data_file: str = "usage-report.data.js", days: int = 14) -> str:
+    """The page. It holds no data: it loads ``data_file`` from its own folder."""
+    return TEMPLATE.replace("__DATA_FILE__", data_file).replace("__DAYS__", str(days))
 
 
 TEMPLATE = r"""<!doctype html>
@@ -131,10 +143,14 @@ details summary{cursor:pointer;color:var(--ink2)}
 <section class="card"><details><summary>Table view and how to read this</summary><div id="table" style="margin-top:12px"></div><div id="notes"></div></details></section>
 </main>
 <div id="tip" role="tooltip"></div>
-<script type="application/json" id="data">__DATA__</script>
+<script src="__DATA_FILE__"></script>
 <script>
 (() => {
-const D = JSON.parse(document.getElementById('data').textContent);
+const D = window.USAGE_DATA;
+if (!D) {
+  document.querySelector('main').insertAdjacentHTML('afterbegin', '<p class="empty">The data file <code>__DATA_FILE__</code> was not found next to this page. Keep the two files together, or run <code>cswap usage-report</code> again.</p>');
+  return;
+}
 const W = D.weights, NS = 'http://www.w3.org/2000/svg';
 const $ = id => document.getElementById(id);
 const accColor = e => `var(--s${D.accounts.findIndex(a => a.email === e) + 1})`;
@@ -450,7 +466,7 @@ function render() {
 }
 
 const bar = document.querySelector('.filters');
-[['all', 'Everything'], ['7d', 'Last 7 days'], ['24h', 'Last 24 hours']].forEach(([k, label]) => {
+[['all', D.days ? `Last ${D.days} days` : 'Everything'], ['7d', 'Last 7 days'], ['24h', 'Last 24 hours']].forEach(([k, label]) => {
   const b = h('button', { type: 'button', text: label, 'aria-pressed': String(k === range) });
   b.addEventListener('click', () => { range = k; bar.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', String(x === b))); render(); });
   bar.append(b);

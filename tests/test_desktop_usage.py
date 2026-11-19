@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from claude_swap import desktop_usage as du
-from claude_swap.desktop_usage_html import payload, render
+from claude_swap.desktop_usage_html import data_script, payload, render
 
 
 @pytest.fixture
@@ -105,15 +105,27 @@ def test_fable_has_its_own_percentage_and_tokens():
     assert week.per_pct(fable, 2.0) == 250
 
 
-def test_the_html_embeds_the_data_and_cannot_break_out_of_its_script():
+def test_the_page_holds_no_data_and_loads_it_from_its_data_file():
     t = "2026-11-03T"
     samples = {"a@x.com": [_sample(t + "10:00:00+00:00", 20.0)]}
     request = _request(t + "11:00:00+00:00", 5)
     request.model = "claude-</script><b>"
-    page = render(du.build_report([request], samples))
-    assert "Desktop usage by account" in page and '"accounts"' in page
-    assert "</script><b>" not in page
-    assert payload(du.build_report([request], samples))["requests"][0]["m"] == "</script><b>"
+    report = du.build_report([request], samples)
+    page = render("my.data.js", 14)
+    assert "Desktop usage by account" in page and 'src="my.data.js"' in page
+    assert '"accounts"' not in page and "</script><b>" not in page
+    data = data_script(report)
+    assert data.startswith("window.USAGE_DATA = {") and '"accounts"' in data
+    assert payload(report)["requests"][0]["m"] == "</script><b>"
+
+
+def test_the_data_file_keeps_only_the_last_days():
+    base = du.parse_time("2026-11-19T12:00:00Z")
+    old, new = _request("2026-11-02T11:00:00+00:00", 5), _request("2026-11-18T11:00:00+00:00", 5)
+    report = du.build_report([old, new], {})
+    report.generated = base
+    assert len(payload(report, days=14)["requests"]) == 1
+    assert len(payload(report, days=0)["requests"]) == 2
 
 
 def test_one_reading_gives_the_current_value_and_no_movement():
@@ -135,5 +147,5 @@ def test_the_ledgers_session_and_request_class_reach_the_report():
     reqs = du.load_requests(ledger, {})
     assert (reqs[0].session, reqs[0].klass) == ("s1", "subagent")
     assert (reqs[1].session, reqs[1].klass) == ("", "")
-    page = render(du.build_report(reqs, {}))
-    assert '"c":"subagent"' in page and '"c":"main"' in page
+    data = data_script(du.build_report(reqs, {}))
+    assert '"c":"subagent"' in data and '"c":"main"' in data

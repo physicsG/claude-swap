@@ -371,6 +371,8 @@ def run(argv: list[str]) -> int:
     )
     parser.add_argument("--html", metavar="PATH", nargs="?", const="", default="",
                         help="where to write the HTML report (default: next to the proxy log)")
+    parser.add_argument("--days", type=int, default=14, metavar="N",
+                        help="days of history in the report (default 14; 0 for everything)")
     parser.add_argument("--no-html", action="store_true", help="print the summary only")
     parser.add_argument("--open", action="store_true", help="open the HTML report in the default browser")
     args = parser.parse_args(argv)
@@ -380,12 +382,14 @@ def run(argv: list[str]) -> int:
     print(summary_text(report))
     if args.no_html:
         return 0
-    from claude_swap.desktop_usage_html import render
+    from claude_swap.desktop_usage_html import data_script, render
 
     out = Path(args.html) if args.html else state_dir() / "usage-report.html"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render(report), encoding="utf-8")
-    print(f"\nReport: {out}", file=sys.stderr)
+    data_file = out.with_suffix(".data.js")
+    data_file.write_text(data_script(report, args.days), encoding="utf-8")
+    out.write_text(render(data_file.name, args.days), encoding="utf-8")
+    print(f"\nReport: {out}\nData:   {data_file}", file=sys.stderr)
     if args.open:
         try:
             os.startfile(out)  # type: ignore[attr-defined]
