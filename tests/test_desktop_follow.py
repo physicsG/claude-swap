@@ -412,6 +412,46 @@ def test_publish_tokens_writes_only_the_accounts_that_are_not_active(home, monke
     assert list(written) == ["b@x.com"] and written["b@x.com"]["accessToken"] == "tok-2"
 
 
+def _expiring_switcher(root, calls, live=False):
+    class Switcher:
+        def _get_sequence_data(self):
+            return json.loads((root / "sequence.json").read_text())
+
+        def _read_account_credentials(self, num, email):
+            return json.dumps({"claudeAiOauth": {"accessToken": "old", "refreshToken": "r", "expiresAt": 1}})
+
+        def _live_session_pids(self, num, email):
+            return [1] if live else []
+
+        def consume_backup_grant(self, num, email, snapshot):
+            calls.append(num)
+            fresh = json.dumps({"claudeAiOauth": {"accessToken": "new", "refreshToken": "r2", "expiresAt": 9_999_999_999_999}})
+            return type("Outcome", (), {"credentials": fresh})()
+
+    return Switcher
+
+
+def test_publish_tokens_renews_a_token_that_is_about_to_expire(home, monkeypatch):
+    root, _ = home
+    _sequence(root, active="1")
+    calls = []
+    monkeypatch.setattr("claude_swap.switcher.ClaudeAccountSwitcher", _expiring_switcher(root, calls))
+    assert df.publish_tokens() == 1
+    assert calls == ["2"]
+    assert json.loads(df.tokens_path().read_text())["accounts"]["b@x.com"]["accessToken"] == "new"
+    df.publish_tokens()  # the next minute: a renewal is not retried at once
+    assert calls == ["2"]
+
+
+def test_publish_tokens_leaves_a_token_a_live_session_owns(home, monkeypatch):
+    root, _ = home
+    _sequence(root, active="1")
+    calls = []
+    monkeypatch.setattr("claude_swap.switcher.ClaudeAccountSwitcher", _expiring_switcher(root, calls, live=True))
+    df.publish_tokens()
+    assert calls == []
+
+
 def test_the_minute_task_publishes_tokens_only_in_per_session_mode(home, monkeypatch):
     calls = []
     monkeypatch.setattr(df, "publish_tokens", lambda: calls.append("tokens"))

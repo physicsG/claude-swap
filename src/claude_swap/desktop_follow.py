@@ -452,6 +452,37 @@ def set_per_session(on: bool) -> None:
     update_state(lambda state: state.pop("per_session", None))
 
 
+REFRESH_RETRY_S = 120
+
+
+def _refreshed(switcher, num: str, email: str, creds: str) -> dict | None:
+    """A stored account's token that is about to expire, renewed through cswap's own consume gate (the
+    one usage collection uses: one-time refresh grant, under its locks, written back to the store).
+    Without this a session pinned to the account is left on the app's own login from the token's
+    expiry until a usage pass happens to renew it, which can be minutes. Skipped while a live session
+    owns the credential, and tried at most once per ``REFRESH_RETRY_S``. None when nothing was renewed."""
+    from claude_swap import oauth
+
+    try:
+        tried = state_dir() / "refresh-tried.json"
+        try:
+            last = json.loads(tried.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            last = {}
+        now = time.time()
+        if now - float(last.get(num, 0)) < REFRESH_RETRY_S:
+            return None
+        if switcher._live_session_pids(num, email):
+            return None
+        last[num] = now
+        state_dir().mkdir(parents=True, exist_ok=True)
+        atomic_write_text(tried, json.dumps(last))
+        outcome = switcher.consume_backup_grant(num, email, creds)
+        return oauth.extract_oauth_data(outcome.credentials or "") if outcome.credentials else None
+    except Exception:
+        return None
+
+
 def publish_tokens() -> int:
     """Write ``tokens.json``: the access token of every stored account that is not the active one, so
     the proxy can bill a session that stays on an account after a switch. The active account's token
@@ -469,7 +500,10 @@ def publish_tokens() -> int:
         for num, account in (data.get("accounts") or {}).items():
             if num == active:
                 continue
-            blob = oauth.extract_oauth_data(switcher._read_account_credentials(num, account.get("email", "")) or "") or {}
+            creds = switcher._read_account_credentials(num, account.get("email", "")) or ""
+            blob = oauth.extract_oauth_data(creds) or {}
+            if blob.get("refreshToken") and oauth.is_oauth_token_expired(blob.get("expiresAt")):
+                blob = _refreshed(switcher, num, account.get("email", ""), creds) or blob
             if blob.get("accessToken"):
                 entries[account["email"]] = {"accessToken": blob["accessToken"], "expiresAt": blob.get("expiresAt")}
         state_dir().mkdir(parents=True, exist_ok=True)
